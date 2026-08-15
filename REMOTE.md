@@ -1,129 +1,131 @@
 > **Note.** Some setup snippets below predate the shipped code. The authoritative implementation is [`relay/server.py`](relay/server.py) + [`host_brain/`](host_brain/): the relay gates on Firebase-token validity + a matching uid room (no email/password, no allowlist), the bridge authenticates with a **service-account custom token**, and the bridge entry point is `bridge_main.py`.
 
-# クラウド遠隔操作 追補 (v1.2)
+# Cloud Remote-Control Addendum (v1.2)
 
-- **追補日**: 2026-07-24
-- **対象**: 宅外(リモート)からの車体遠隔操作の追加。既存 LAN 動作(追補 v1.1)は一切壊さない。
-- **位置づけ**: 本書は `REQUIREMENTS.md` および `DESIGN.md` への**Remote 専用追補**である。LAN 要件と番号衝突させないため、機能要件は `RFR-*`、非機能要件は `RNFR-*`、前提は `RAS-*`、対象外は `ROS-*` を用いる。
-- **クラウド基盤**: GCP プロジェクト `YOUR-GCP-PROJECT`(番号 YOUR-PROJECT-NUMBER、アカウント you@example.com)+ Firebase Auth。推奨リージョン `asia-northeast1`(東京)。
-- **基準コード**: `~/esp32-ai-robot/host_brain/` — `car_link.py`(`CommandLink`/`VideoLink`)、`safety.py`(`SafetyMonitor`)、`dispatcher.py`、`brain.py`(`Brain.decide`)、`main.py`(`brain_loop`/`goal_loop`/`arbiter_loop` アービタ)。これらは**そのまま再利用**でき、家ブリッジの土台になる。iOS 側の実装母体は `ios_app/`(`CarLink`/`RobotController`/`ContentView`/`Brain`/`Dispatcher`/`Discovery`、`project.yml`、`Info.plist`)。
+- **Addendum date**: 2026-07-24
+- **Scope**: Adds remote (off-site) control of the car body. Existing LAN operation (addendum v1.1) is left completely intact.
+- **Positioning**: This document is a **Remote-only addendum** to `REQUIREMENTS.md` and `DESIGN.md`. To avoid numbering collisions with the LAN requirements, functional requirements use `RFR-*`, non-functional requirements `RNFR-*`, assumptions `RAS-*`, and out-of-scope items `ROS-*`.
+- **Cloud platform**: GCP project `YOUR-GCP-PROJECT` (number YOUR-PROJECT-NUMBER, account you@example.com) + Firebase Auth. Recommended region `asia-northeast1` (Tokyo).
+- **Baseline code**: `host_brain/` — `car_link.py` (`CommandLink`/`VideoLink`), `safety.py` (`SafetyMonitor`), `dispatcher.py`, `brain.py` (`Brain.decide`), `main.py` (the `brain_loop`/`goal_loop`/`arbiter_loop` arbiter). These are **reused as-is** and form the foundation of the home bridge. The iOS side is built on `ios_app/` (`CarLink`/`RobotController`/`ContentView`/`Brain`/`Dispatcher`/`Discovery`, plus `project.yml`, `Info.plist`).
 
-## 採用トポロジ(前提)
+## Adopted topology (assumption)
 
-`iPhone ⇔WSS(TLS)⇔ Cloud Run WebSocket リレー ⇔WSS(TLS)⇔ ホームブリッジ(host_brain 拡張・Python) ⇔LAN TCP⇔ 車体`。
+`iPhone ⇔WSS(TLS)⇔ Cloud Run WebSocket relay ⇔WSS(TLS)⇔ home bridge (host_brain extension, Python) ⇔LAN TCP⇔ car body`.
 
-**ESP32 は TLS/WS/カメラ処理が過負荷になるためクラウドへ直接接続しない。** TLS/WS の終端と既存 LAN コードの再利用は**家ブリッジ**が担う。リレーは Firebase Auth でフォンとブリッジ双方を認証し、**ペア済みの相手同士のみ**を中継する不透明フォワーダである。レイテンシは概念B(熟慮ループ)前提のため、リレー 1 ホップ分の追加遅延は許容範囲。
+**The ESP32 never connects directly to the cloud**, because TLS/WS/camera handling would overload it. Terminating TLS/WS and reusing the existing LAN code is the job of the **home bridge**. The relay authenticates both the phone and the bridge with Firebase Auth and, being an opaque forwarder, relays traffic **only between an already-paired pair**. Because the latency budget assumes concept B (the deliberative loop), the extra delay of a single relay hop is acceptable.
 
-## 用語(本追補で追加)
+> **Firmware note.** The ESP32 car firmware — which terminates the LAN TCP protocol (`CMD_*` on :4000, JPEG stream on :7000) and provides the onboard deadman / stop-and-hold used as the last-resort backstop below — is a Freenove-derived sketch (CC BY-NC-SA) and is **not included in this repository**. Firmware paths and behavior are referenced here descriptively only.
 
-- **ホームブリッジ(bridge)**: 宅内 LAN 上で常駐する `host_brain` 拡張プロセス。車体への LAN TCP を保持し、リレーへ WSS で常時接続する。車体への**唯一の書き込み者**(LAN 側 `RobotController` 相当の責務を引き継ぐ)。
-- **リレー(relay)**: Cloud Run 上の WebSocket 中継。認証・ペアリング検証・フレーム転送のみを行い、`CMD_*` の意味は解さない不透明フォワーダ。
-- **LAN モード / Remote モード**: アプリの接続方式。LAN=既存の直 TCP、Remote=リレー経由。**トグルは「トランスポート」と「脳の所在」を同時に切り替える**(§2-C 参照)。LAN=アプリ内 `Brain`(onDevice)+車に直結、Remote=ブリッジ経由(脳もブリッジ側、onBridge)。
+## Terminology (added by this addendum)
 
----
-
-# 1. 要件
-
-## F1. 接続モードとトポロジ(機能)
-
-- **RFR-1**: アプリは **LAN モード**(車体へ直 TCP／既存 `CarLink`・mDNS 経路)と **Remote モード**(リレー経由の WSS)の 2 方式を持ち、設定画面にモード切替トグルを設けること。選択したモードは永続化すること(`UserDefaults` キー `linkMode`、既定は `lan`)。切替時は既存接続を安全に閉じ(停止コマンド送出後にクローズ)てから新方式で再接続すること。
-- **RFR-2**: Remote モードの経路は `iPhone ⇔WSS⇔ リレー ⇔WSS⇔ ブリッジ ⇔LAN TCP⇔ 車体` とすること。**ESP32 は一切クラウドへ直接接続しない**こと(TLS/WS/カメラ送出の負荷を車体に課さない)。`CMD_*`／カメラフレームはブリッジと車体の間の LAN TCP 上のみで直接授受し、リレーはその上位(ブリッジ⇔フォン間)を運ぶ。
-- **RFR-3**: ホームブリッジは既存 `host_brain/`(LAN TCP で車体へ接続する CarLink 相当)を拡張して実装し、(a) 車体への LAN TCP :4000/:7000 を保持、(b) リレーへ Firebase トークンで認証した WSS を保持し自動再接続、(c) フォンからの遠隔コマンド／ゴールを LAN 側 `CMD_*` に落として車体へ送出、(d) 車体テレメトリ・映像プレビューをリレー経由でフォンへ返す、ことを担うこと。ブリッジは既存の LAN 側 `CMD_*` 変換・クランプ・安全反射ロジック(`dispatcher`／`safety`)を再利用すること。
-- **RFR-4**: リレーは、Firebase Auth で認証され、かつ現行 MVP では同一 `uid` のフォンとブリッジのみを中継すること。未認証の接続に対して車体プロトコル(`CMD_*`／カメラ)を一切露出しないこと。Firestore `devices` による claim/unpair は Phase 2 とする。
-
-## F2. ペアリング(アプリ ⇔ 1 台のホームブリッジ／車体)
-
-- **RFR-5**: MVP では、アプリとホームブリッジは同一 Firebase `uid` で認証され、リレーの `uid -> {phone, bridge}` ルームで 1 台のブリッジ(＝ 1 台の車体)へ接続すること。
-- **RFR-6**: claim / unpair / Firestore `devices/{deviceId}` / 複数端末閲覧や operator 排他ロックは Phase 2 の本番強化とし、MVP の必須受入から分離すること。
-
-## F3. 遠隔ライブ映像・コマンド・AI ゴール
-
-- **RFR-7**: Remote モードでも、LAN モードと同じ操縦 UX(全画面ライブ映像・所見表示・ゴール入力・STOP)を提供すること。映像はブリッジがリレー経由でフォンへ送るプレビューストリームとして表示すること(フレーム形式・解像度は §1-N の帯域予算に従い、必要に応じて LAN 実映像より低 fps／低画質に落としてよい)。
-- **RFR-8**: Remote モードで、テキスト／音声によるゴール入力(FR-13〜17)と主要コマンド(頭部 `look`・表情・STOP・手動 `drive` 等)をリレー経由でブリッジへ送達し、ブリッジがそれを車体の `CMD_*` に変換して実行できること。生 `CMD_*` をフォンやリレーから直接送れない構造(意味コマンドのみを中継し、`CMD_*` への変換・クランプはブリッジが一手に担う)を維持すること。
-- **RFR-9**: Remote モードにおける AI 頭脳(OpenAI Vision → `Intent` ループ)は**ホームブリッジ側で実行すること**(§2-C の設計判断)。この構成では認知ループ用の映像は宅内 LAN に留まり、フォンは「プレビューを見る／ゴールを与える／所見・状態・テレメトリを受け取る／即停止する」ためのシンクライアントとする。ブリッジが OpenAI を呼び、`observation`／`task_state`／実効 pan/tilt 等をリレー経由でフォンへ返すこと。
-
-## F4. 遠隔緊急停止と「見えない走行」の安全
-
-- **RFR-10**: Remote モードでも常時可視の STOP を提供し、押下でリレー経由の即時停止(ブリッジが `CMD_MOTOR#0#0#0` を送出)を実行すること。加えて、STOP はリレー往復や AI 判断に依存しない多重の安全網で担保すること: (a) ブリッジ側の**デッドマン**(フォンからのハートビート／意図更新が一定時間途絶したら車体を停止)、(b) 車体オンボードのデッドマン・切断時 stop-and-hold(HC-6)。リレー切断そのものがブリッジ側デッドマン発火→車体停止につながること。
-- **RFR-11**: Remote モードではドライランを既定 ON とし、モーション実行には明示的な dry-run OFF/arm 確認を要すること。arm は「dry-run を OFF にする」だけであり、relay/operator/cmd/video/deadman/low-batt safety が引き続き上位で停止権限を持つこと。切断・STOP・モード切替・アプリ停止では自動 disarm（dry-run ON）へ戻すこと。
-
-## F5. グレースフルフォールバックと再接続
-
-- **RFR-12**: MVP の到達判定はユーザー選択の LAN/Remote トグルとする。自動 LAN 優先・宅外判定は Phase 2 とする。モード遷移は必ず一旦停止(現行駆動をクランプ／停止)を挟み、暴走なく行うこと。切替中・切替後の実効モードを UI に明示すること。
-- **RFR-13**: リレー接続・ブリッジ接続・車体接続それぞれの状態(フォン⇔リレー、リレー⇔ブリッジ、ブリッジ⇔車体)を UI に可視化し、いずれかが切れた場合は自動再接続を試みること。フォン⇔リレー切断時はブリッジ側デッドマンにより車体が安全停止すること(RFR-10)。ブリッジ⇔車体切断時は車体のオンボード安全機構(HC-6)に委ね、アプリ／ブリッジは落ち着いて再接続すること。切断で駆動が継続しないことを設計要件とする。
-
-## N1. 非機能要件(NFR)
-
-### セキュリティ(必須)
-
-- **RNFR-1**: フォン⇔リレー、リレー⇔ブリッジの全区間を **WSS/TLS** で暗号化すること。平文 WS／平文 TCP をクラウド経路に一切用いないこと。Cloud Run のマネージド証明書(HTTPS/WSS)を用い、証明書検証を無効化しないこと。
-- **RNFR-2**: リレーはフォンとブリッジの**双方**を **Firebase Auth トークン**で認証すること。現行 MVP は WS 接続後の最初の JSON hello に `token` を含めて検証し、無効・失効トークンは close code 4003 で拒否する。将来強化では WS upgrade の `Authorization: Bearer` ヘッダへ移行してよい。
-- **RNFR-3**: **ユーザー単位ペアリング**を強制し、MVP では同一 `uid` の相手にのみフレームを転送すること。未認証で車体プロトコルを露出しないこと。リレーは映像・コマンド等のメディアを永続化しない(透過中継のみ)こと。Firebase Auth トークン・ペアリング資格情報を URL クエリやログに出さないこと。
-- **RNFR-4**: 車体への書き込みは**ブリッジのみ**(単一書き込み者)とし、リレーは `CMD_*` の意味を解さない不透明フォワーダに徹すること。リレー／ブリッジのサービスアカウント権限は最小権限(GCP プロジェクト `YOUR-GCP-PROJECT` 内、必要な Firebase/Run 権限のみ)とすること。
-
-### 安全性(見えない走行)
-
-- **RNFR-5**: 直接目視できない遠隔走行は LAN 監視付き運用より高リスクである前提に立ち、UI・既定値がその前提を損なわないこと(Remote 時ドライラン既定 ON、より保守的な速度上限、常時可視 STOP、映像途絶時停止)。停止はネットワーク往復や AI 判断に依存せず、車体オンボード＋ブリッジのデッドマンで最終担保すること(NFR-5 を遠隔多段構成へ拡張)。
-
-### レイテンシと帯域
-
-- **RNFR-6**: リレー経由プレビュー映像の帯域予算は **約 4 KB/フレーム × 12 fps ≈ 48 KB/s ≈ 384 kbps(下り、フォン方向)**を上限目安とすること。ゴール・コマンド・テレメトリ(上り／下りとも)はこれに比べ小さいこと。RFR-9(ブリッジ側 AI)により**認知ループのフレームはリレーを通さない**ため、リレーを流れる映像は人間監視用プレビューの 1 本に限定し、必要なら fps／画質を落として予算内に収めること(設計上は実測 2〜5 fps・0.1〜0.2 Mbps 程度までさらに間引く運用を推奨)。
-- **RNFR-7**: 遠隔経路はリレー 1 ホップ分の追加遅延を許容する(熟慮的 concept-B ループのため許容範囲)こと。ただし STOP・デッドマンは往復遅延の影響を受けにくいよう、ブリッジ／車体側の局所安全機構で担保し(RNFR-5)、リレー遅延増大時も停止が遅延しない設計とすること。
-
-### コスト
-
-- **RNFR-8**: Cloud Run リレーは低コスト運用(小サイズ単一インスタンス、アイドル時スケールダウン、egress 最小化)とすること。個人利用 1 ペア前提で、常時接続 WSS を維持しつつ月額を最小化する構成(最小インスタンス数・並行数の適正化)を選ぶこと。RFR-9 により OpenAI 呼び出しの egress は宅内ブロードバンド側に寄せ、クラウド転送コストを抑えること。
-
-### 可用性
-
-- **RNFR-9**: リレーは単一リージョン運用でよい(個人利用前提)。リレーまたはブリッジが停止した場合、Remote 操作は不能となるが、(a) 同一 LAN 上では LAN モードが影響を受けず利用でき、(b) 遠隔経路喪失時は車体がブリッジ／オンボードのデッドマンで安全停止すること。可用性低下がフェイルセーフ(停止)側に倒れることを要件とする。
-
-## 制約・前提(本追補)
-
-- **RAS-1**: ホームブリッジは宅内 LAN 上で稼働(`host_brain` 拡張、Python)し、車体と同一 LAN・上流インターネットに接続していること。
-- **RAS-2**: フォン・ブリッジは同一の Firebase `uid` で認証し、リレーは GCP プロジェクト `YOUR-GCP-PROJECT` にデプロイされていること。
-- **ROS-1(対象外)**: 複数車体・複数ブリッジ・複数ユーザー共有、リレーのマルチリージョン冗長化、Remote 経路での高解像度／高 fps 映像は本追補の対象外。
+- **Home bridge (bridge)**: A long-running `host_brain` extension process on the home LAN. It holds the LAN TCP connection to the car and keeps a persistent WSS connection to the relay. It is the **sole writer** to the car (inheriting the responsibilities of the LAN-side `RobotController`).
+- **Relay**: A WebSocket forwarder on Cloud Run. It performs only authentication, pairing verification, and frame forwarding; it is an opaque forwarder that does not understand the meaning of `CMD_*`.
+- **LAN mode / Remote mode**: The app's connection method. LAN = the existing direct TCP path; Remote = via the relay. **The toggle switches both the "transport" and the "location of the brain" at once** (see §2-C). LAN = the app's in-process `Brain` (onDevice) directly connected to the car; Remote = via the bridge (the brain runs on the bridge, onBridge).
 
 ---
 
-# 2. アーキテクチャ(中継 ＋ 家ブリッジ)
+# 1. Requirements
 
-## トポロジ(text/ASCII)
+## F1. Connection modes and topology (functional)
+
+- **RFR-1**: The app shall support two methods — **LAN mode** (direct TCP to the car / the existing `CarLink` + mDNS path) and **Remote mode** (WSS via the relay) — and provide a mode toggle in the settings screen. The selected mode shall be persisted (`UserDefaults` key `linkMode`, default `lan`). On switching, the existing connection shall be closed safely (send a stop command, then close) before reconnecting with the new method.
+- **RFR-2**: The Remote-mode path shall be `iPhone ⇔WSS⇔ relay ⇔WSS⇔ bridge ⇔LAN TCP⇔ car`. **The ESP32 shall never connect directly to the cloud** (no TLS/WS/camera-send load on the car body). `CMD_*` and camera frames shall be exchanged directly only over the LAN TCP between the bridge and the car; the relay carries only the layer above that (bridge⇔phone).
+- **RFR-3**: The home bridge shall be implemented by extending the existing `host_brain/` (the CarLink equivalent that connects to the car over LAN TCP), and shall (a) hold the LAN TCP :4000/:7000 to the car, (b) hold a WSS to the relay authenticated with a Firebase token and auto-reconnect, (c) lower the phone's remote commands/goals into LAN-side `CMD_*` and send them to the car, and (d) return car telemetry and a video preview to the phone via the relay. The bridge shall reuse the existing LAN-side `CMD_*` translation, clamping, and safety-reflex logic (`dispatcher`/`safety`).
+- **RFR-4**: The relay shall relay only a phone and a bridge that are authenticated with Firebase Auth and, in the current MVP, share the same `uid`. It shall never expose the car protocol (`CMD_*`/camera) to unauthenticated connections. Firestore `devices` claim/unpair is Phase 2.
+
+## F2. Pairing (app ⇔ one home bridge / car)
+
+- **RFR-5**: In the MVP, the app and the home bridge shall be authenticated with the same Firebase `uid`, and shall connect through the relay's `uid -> {phone, bridge}` room to a single bridge (= a single car).
+- **RFR-6**: claim / unpair / Firestore `devices/{deviceId}` / multi-device viewing / an operator exclusive lock are Phase-2 production hardening and shall be separated from the MVP's required acceptance criteria.
+
+## F3. Remote live video, commands, and AI goals
+
+- **RFR-7**: Remote mode shall provide the same piloting UX as LAN mode (full-screen live video, observation display, goal input, STOP). Video shall be shown as a preview stream that the bridge sends to the phone via the relay (frame format/resolution follow the bandwidth budget of §1-N, and may be dropped to lower fps/quality than the real LAN video as needed).
+- **RFR-8**: In Remote mode, text/voice goal input (FR-13–17) and the main commands (head `look`, expression, STOP, manual `drive`, etc.) shall be delivered to the bridge via the relay, and the bridge shall translate them into the car's `CMD_*` and execute them. A structure in which raw `CMD_*` cannot be sent directly from the phone or the relay shall be maintained (only semantic commands are relayed; translation to `CMD_*` and clamping are handled solely by the bridge).
+- **RFR-9**: The AI cortex in Remote mode (the VLM vision → `Intent` loop) shall **run on the home bridge** (the design decision of §2-C). In this configuration the perception-loop video stays on the home LAN, and the phone is a thin client used to "watch the preview / give goals / receive observations, state, and telemetry / stop immediately." The bridge calls the VLM provider and returns `observation` / `task_state` / effective pan/tilt, etc. to the phone via the relay.
+
+## F4. Remote emergency stop and safety for "driving blind"
+
+- **RFR-10**: Remote mode shall provide an always-visible STOP, and pressing it shall execute an immediate stop via the relay (the bridge sends `CMD_MOTOR#0#0#0`). In addition, STOP shall be guaranteed by multiple safety nets that do not depend on the relay round-trip or on any AI decision: (a) a **deadman** on the bridge (stop the car if the phone's heartbeat / intent updates lapse for a set time), and (b) the car's onboard deadman and disconnect-time stop-and-hold (HC-6). Loss of the relay itself shall lead to the bridge-side deadman firing → the car stopping.
+- **RFR-11**: In Remote mode, dry-run shall be ON by default, and executing motion shall require an explicit dry-run OFF / arm confirmation. Arming only "turns dry-run OFF"; the relay/operator/cmd/video/deadman/low-batt safety continue to hold stop authority above it. On disconnect, STOP, mode switch, or app stop, the system shall automatically disarm (dry-run ON).
+
+## F5. Graceful fallback and reconnection
+
+- **RFR-12**: The MVP's reachability decision shall be the user-selected LAN/Remote toggle. Automatic LAN preference and off-site detection are Phase 2. Mode transitions shall always insert a stop (clamp/stop the current drive) and shall be performed without any runaway. The effective mode during and after switching shall be made explicit in the UI.
+- **RFR-13**: The states of the relay connection, bridge connection, and car connection (phone⇔relay, relay⇔bridge, bridge⇔car) shall be visualized in the UI, and if any of them drops, auto-reconnect shall be attempted. When the phone⇔relay link drops, the bridge-side deadman shall safely stop the car (RFR-10). When the bridge⇔car link drops, it shall be left to the car's onboard safety mechanism (HC-6), and the app/bridge shall calmly reconnect. It is a design requirement that drive never continues through a disconnect.
+
+## N1. Non-functional requirements (NFR)
+
+### Security (required)
+
+- **RNFR-1**: The entire phone⇔relay and relay⇔bridge path shall be encrypted with **WSS/TLS**. Plaintext WS / plaintext TCP shall never be used on the cloud path. Cloud Run's managed certificates (HTTPS/WSS) shall be used, and certificate verification shall not be disabled.
+- **RNFR-2**: The relay shall authenticate **both** the phone and the bridge with a **Firebase Auth token**. The current MVP verifies the `token` included in the first JSON hello after the WS connection, and rejects invalid/expired tokens with close code 4003. A future hardening may move to an `Authorization: Bearer` header on the WS upgrade.
+- **RNFR-3**: **Per-user pairing** shall be enforced, and in the MVP frames shall be forwarded only to a peer with the same `uid`. The car protocol shall not be exposed unauthenticated. The relay shall not persist media such as video or commands (transparent relay only). Firebase Auth tokens and pairing credentials shall not appear in URL queries or logs.
+- **RNFR-4**: Writing to the car shall be **the bridge only** (single writer), and the relay shall remain an opaque forwarder that does not understand the meaning of `CMD_*`. The relay/bridge service-account permissions shall be least-privilege (only the Firebase/Run permissions needed within GCP project `YOUR-GCP-PROJECT`).
+
+### Safety (driving blind)
+
+- **RNFR-5**: On the premise that remote driving without direct line-of-sight is higher-risk than LAN-supervised operation, the UI and defaults shall not undermine that premise (dry-run ON by default in Remote, a more conservative speed cap, an always-visible STOP, stop on video lapse). Stopping shall not depend on a network round-trip or an AI decision, and shall be ultimately guaranteed by the car's onboard deadman + the bridge's deadman (extending NFR-5 into a multi-tier remote configuration).
+
+### Latency and bandwidth
+
+- **RNFR-6**: The bandwidth budget of the relayed preview video shall have an upper target of **about 4 KB/frame × 12 fps ≈ 48 KB/s ≈ 384 kbps (downlink, toward the phone)**. Goals, commands, and telemetry (both uplink and downlink) shall be small compared to this. Because of RFR-9 (brain on the bridge), **the cognition-loop frames do not pass through the relay**, so the video flowing through the relay is limited to a single human-supervision preview, and its fps/quality may be dropped to stay within budget (in practice, a design recommendation is to thin it further to about 2–5 fps and 0.1–0.2 Mbps).
+- **RNFR-7**: The remote path shall tolerate the extra delay of a single relay hop (acceptable because of the deliberative concept-B loop). However, STOP and the deadman shall be guaranteed by local safety mechanisms on the bridge/car side so that they are not affected by round-trip delay (RNFR-5), and the design shall keep stopping from being delayed even when relay latency grows.
+
+### Cost
+
+- **RNFR-8**: The Cloud Run relay shall run at low cost (a small single instance, scale-down when idle, minimized egress). Assuming personal use with one pair, it shall choose a configuration that keeps monthly cost minimal while maintaining an always-on WSS (properly tuned min-instances and concurrency). By RFR-9, the VLM API-call egress shall be pushed to the home broadband side, keeping cloud transfer cost down.
+
+### Availability
+
+- **RNFR-9**: The relay may run in a single region (assuming personal use). If the relay or the bridge goes down, Remote operation becomes impossible, but (a) on the same LAN, LAN mode is unaffected and usable, and (b) on loss of the remote path, the car safely stops via the bridge/onboard deadman. It is a requirement that reduced availability falls to the fail-safe (stop) side.
+
+## Constraints / assumptions (this addendum)
+
+- **RAS-1**: The home bridge runs on the home LAN (`host_brain` extension, Python) and is connected to the same LAN as the car and to the upstream internet.
+- **RAS-2**: The phone and the bridge authenticate with the same Firebase `uid`, and the relay is deployed in GCP project `YOUR-GCP-PROJECT`.
+- **ROS-1 (out of scope)**: Multiple cars / multiple bridges / multi-user sharing, multi-region redundancy of the relay, and high-resolution / high-fps video on the Remote path are out of scope for this addendum.
+
+---
+
+# 2. Architecture (relay + home bridge)
+
+## Topology (text/ASCII)
 
 ```
    ┌─────────────────────────────────────────────┐
-   │  iPhone / RobotBrain app        （宅外・WWAN）│
-   │  薄いクライアント:                            │
+   │  iPhone / RobotBrain app         (off-site/WWAN)│
+   │  Thin client:                                │
    │  watch(preview) + goal + E-STOP + heartbeat  │
    └───────────────────┬─────────────────────────┘
                        │  WSS / TLS
                        │  WSS + hello.token (Firebase ID token)
                        ▼
    ┌─────────────────────────────────────────────┐
-   │  Cloud Run: WebSocket リレー (robot-relay)    │  asia-northeast1
-   │  認証 / ペアリング検証 / 多重化 / 素通し       │  --max-instances 1
-   │  → CMD_ を解釈しない不透明フォワーダ（土管）   │  --timeout 3600
+   │  Cloud Run: WebSocket relay (robot-relay)     │  asia-northeast1
+   │  auth / pairing check / mux / pass-through    │  --max-instances 1
+   │  → opaque forwarder that never parses CMD_    │  --timeout 3600
    └───────────────────┬─────────────────────────┘
                        │  WSS / TLS
-                       │  device ID token (Bearer)
+                       │  hello.token (bridge ID token)
                        ▼
    ┌─────────────────────────────────────────────┐
-   │  家ブリッジ = host_brain 拡張 (Python)         │  （宅内 LAN）
+   │  Home bridge = host_brain extension (Python)  │  (home LAN)
    │  relay_link + arbiter + brain + safety         │
-   │  ＝車体への唯一の書き込み者・脳の所在          │
+   │  = sole writer to the car + location of brain  │
    └───────────────────┬─────────────────────────┘
-                       │  平文 TCP :4000 (CMD_)  ← LAN から出ない
-                       │  平文 TCP :7000 (JPEG)  ← LAN から出ない
+                       │  plaintext TCP :4000 (CMD_)  ← never leaves the LAN
+                       │  plaintext TCP :7000 (JPEG)  ← never leaves the LAN
                        ▼
    ┌─────────────────────────────────────────────┐
-   │  Freenove 4WD ESP32 車体                       │
+   │  Freenove 4WD ESP32 car body                   │
    └─────────────────────────────────────────────┘
 
-   Firebase Auth (+ Firestore devices/)
-        └── token 検証 / ペアリング照合 ──▶ リレー
+   Firebase Auth (+ Firestore devices/ in Phase 2)
+        └── token verification / pairing check ──▶ relay
 ```
 
-同じ構造を注記付きで示すと以下(mermaid):
+The same structure with annotations (mermaid):
 
 ```mermaid
 flowchart LR
@@ -131,215 +133,222 @@ flowchart LR
     UI[Thin client:<br/>watch + goal + E-STOP + heartbeat]
   end
   subgraph Cloud[Cloud Run: WS relay]
-    R[relay<br/>認証・ペアリング・多重化・バックプレッシャ]
+    R[relay<br/>auth / pairing / mux / backpressure]
   end
-  subgraph Home[家庭 LAN]
-    B[home bridge = host_brain 拡張<br/>relay_link + arbiter + brain + safety]
+  subgraph Home[Home LAN]
+    B[home bridge = host_brain extension<br/>relay_link + arbiter + brain + safety]
     Car[Freenove 4WD ESP32]
   end
   UI <-- WSS/TLS<br/>hello.token idToken --> R
-  R <-- WSS/TLS<br/>device idToken --> B
+  R <-- WSS/TLS<br/>hello.token bridge --> B
   B <-- TCP :4000 CMD_ --> Car
   B <-- TCP :7000 JPEG --> Car
-  FB[(Firebase Auth<br/>+ Firestore devices/)]:::ext -.token 検証/ペアリング.- R
+  FB[(Firebase Auth<br/>+ Firestore devices/ Phase 2)]:::ext -.token verify/pairing.- R
   classDef ext fill:#eee,stroke:#999;
 ```
 
-## A. Cloud Run WebSocket 中継サーバ(relay)
+## A. Cloud Run WebSocket relay
 
-役割は**土管**に徹する: 認証済みの同一オーナに属する 1 台の phone(群)と 1 台の bridge を突き合わせ、フレームを右から左へ流すだけ。車体プロトコル(`CMD_*`)を解釈しない・平文で露出しない。実装は Python(**FastAPI + `uvicorn`**、あるいは素の `websockets`)+ `firebase-admin`。理由: 家ブリッジと同一言語で保守を一本化でき、`verify_id_token` が Admin SDK で完結する。
+Its role is strictly a **dumb pipe**: it matches up one phone (or phones) and one bridge belonging to the same authenticated owner, and shuttles frames from one side to the other. It does not interpret the car protocol (`CMD_*`) and does not expose it in plaintext. The shipped implementation is Python (plain `websockets`) + `firebase-admin` — `relay/server.py`. Rationale: the same language as the home bridge unifies maintenance, and `verify_id_token` is fully handled by the Admin SDK. (An early sketch in FastAPI + `uvicorn` was superseded — see §4-C.1.)
 
-### A.1 接続・認証ハンドシェイク(Firebase ID トークン検証)
+### A.1 Connection / auth handshake (Firebase ID token verification)
 
-- **現行 MVP のトークンの運び方**: WSS 接続後、最初の JSON フレームを hello として送り、`{"role":"phone"|"bridge","token":"<Firebase ID token>","room":"<dev room>"}` を含める。URL/クエリには**絶対に載せない**。`AUTH_DISABLED=1` のローカル検証時のみ `room` を使い、本番は検証済み `uid` を room とする。
-  - phone: `RelayClient` が接続直後に fresh ID token を取得し、hello の `token` に入れる。
-  - bridge: `relay_link.py` が `BridgeAuth.id_token()` から fresh ID token を取得し、hello の `token` に入れる。
-- **検証**: relay は最初の hello 受信時に `auth.verify_id_token(token)` を実行する。失敗なら close code `4003` で拒否し、未認証を一切ブリッジしない。成功時、`uid` を取り出して `uid -> {phone, bridge}` に登録する。
-- **将来強化**: WS upgrade の `Authorization: Bearer <Firebase ID token>` ヘッダ検証や、401/4401 での upgrade 拒否は Phase 2 の堅牢化として扱う。現行 MVP の受入基準は `hello.token` と close `4003`。
-- **役割(role)**: `role="phone"` または `role="bridge"` を hello で宣言する。MVP では同一 `uid` がペアリングキー。本番では `deviceId` / `ownerUid` / `allowedUids` クレームへ拡張する。
-- **トークン寿命**: Firebase ID トークンは約 1 時間で失効。phone は再接続ごとに fresh token を取得し、bridge は期限約 1 分前に更新する。55 分先回り再接続、指数バックオフ、ジッタは Phase 2 の堅牢化とする。
+- **How the token is carried in the current MVP**: After the WSS connection, the first JSON frame is sent as a hello and includes `{"role":"phone"|"bridge","token":"<Firebase ID token>","room":"<dev room>"}`. It is **never** placed in the URL/query. `room` is used only during local verification with `AUTH_DISABLED=1`; in production the verified `uid` is the room.
+  - phone: `RelayClient` obtains a fresh ID token immediately on connect and places it in the hello's `token`.
+  - bridge: `relay_link.py` obtains a fresh ID token from `BridgeAuth.id_token()` and places it in the hello's `token`.
+- **Verification**: On receiving the first hello, the relay runs `auth.verify_id_token(token)`. On failure it rejects with close code `4003` and bridges nothing unauthenticated. On success it extracts the `uid` and registers into `uid -> {phone, bridge}`. Other close codes the relay uses: `4000` (no/malformed hello), `4001` (bad role), and `4009` (an existing socket of the same role is displaced by a newer connection).
+- **Future hardening**: `Authorization: Bearer <Firebase ID token>` header verification on the WS upgrade, and upgrade rejection with 401/4401, are treated as Phase-2 robustness. The current MVP's acceptance criterion is `hello.token` and close `4003`.
+- **Role**: `role="phone"` or `role="bridge"` is declared in the hello. In the MVP, the same `uid` is the pairing key. In production it extends to `deviceId` / `ownerUid` / `allowedUids` claims.
+- **Token lifetime**: A Firebase ID token expires in about 1 hour. The phone obtains a fresh token on every reconnect, and the bridge re-mints about 1 minute before expiry. Pre-emptive reconnection 55 minutes out, exponential backoff, and jitter are Phase-2 robustness.
 
-### A.2 ペアリングモデル(オーナ／部屋の対応付け)
+### A.2 Pairing model (owner/room association)
 
-段階に応じて 2 段構えとする(§6 実装計画で MVP→本番)。
+Two stages depending on maturity (MVP → production in the §6 implementation plan).
 
-**MVP(同一 uid ペアリング)**: ブリッジを**フォンと同一の Firebase アカウント**でサインインさせ、relay は同一 `uid` 同士を自動ペア。任意で `ALLOWED_UIDS` 許可リストを持つ。relay 内メモリレジストリは `uid -> {phone:ws, bridge:ws}`。
+**MVP (same-uid pairing)**: Sign the bridge in with the **same Firebase account as the phone** (see §B.3 — the bridge does this headlessly via a service-account custom token for the same uid), and the relay auto-pairs sockets that share the same `uid`. The relay's in-memory registry is `uid -> {phone:ws, bridge:ws}`. There is **no allowlist** — the relay gates purely on Firebase-token validity plus a matching uid room.
 
-**本番(Firestore レジストリ)**: Firestore に最小のレジストリを持つ(relay 自体がステートフルなのは接続の間だけ)。
+**Production (Firestore registry)**: Keep a minimal registry in Firestore (the relay itself is stateful only for the duration of a connection).
 
-| コレクション/ドキュメント | フィールド | 用途 |
+| Collection/document | Fields | Purpose |
 |---|---|---|
-| `devices/{deviceId}` | `ownerUid`, `roomName`, `pairedAt`, `lastSeen`, `status`, `allowedUids[]`(任意で家族共有) | 1 ブリッジ = 1 デバイス。オーナと部屋名を保持 |
-| `users/{uid}` | `defaultDeviceId` 等 | phone 側の既定ペア |
+| `devices/{deviceId}` | `ownerUid`, `roomName`, `pairedAt`, `lastSeen`, `status`, `allowedUids[]` (optional family sharing) | 1 bridge = 1 device. Holds the owner and room name |
+| `users/{uid}` | `defaultDeviceId`, etc. | The phone's default pair |
 
-- **突き合わせ規則**: phone が `deviceId` を宣言 → relay は `devices/{deviceId}.ownerUid == phone.uid`(または `uid ∈ allowedUids`)を確認。bridge のクレーム `deviceId`/`ownerUid` と一致するときだけ両者を**同一ルームにブリッジ**。
-- relay 内メモリレジストリ: `deviceId -> {bridgeConn, phoneConns:set}`。bridge は 1 本、phone は複数可(見るだけの家族端末を許すなら)。ただし**運動権限(goal/intent/heartbeat)は 1 端末に排他ロック**("operator" トークン)し、他は閲覧専用にする(二重操縦の暴走防止)。
-- **部屋(room) = ペアリングキー**。将来の複数拠点は deviceId 単位ルーティングで自然にスケール(OS-9)。
+- **Matching rule**: The phone declares a `deviceId` → the relay checks `devices/{deviceId}.ownerUid == phone.uid` (or `uid ∈ allowedUids`). Only when it matches the bridge's claimed `deviceId`/`ownerUid` does it **bridge the two into the same room**.
+- Relay in-memory registry: `deviceId -> {bridgeConn, phoneConns:set}`. The bridge is a single connection; the phone may be multiple (if view-only family devices are allowed). However, **motion authority (goal/intent/heartbeat) is exclusively locked to one device** (an "operator" token), and the others are view-only (to prevent runaway from dual piloting).
+- **The room = the pairing key**. Future multi-site naturally scales with per-deviceId routing (OS-9).
 
-### A.3 メッセージ多重化とフレーミング仕様(WebSocket)
+### A.3 Message multiplexing and framing spec (WebSocket)
 
-1 本の WS 上で、WebSocket ネイティブの**テキスト/バイナリ両フレーム型**を使い分けて多重化する。
+Multiplexing over a single WS uses WebSocket's native **text/binary frame types**.
 
-**テキストフレーム = 制御／コマンド／テレメトリ(JSON、小)**。type タグ付き(本仕様の正準キーは `t`。アプリ側コードで用いる `type` は同一フィールドの別名):
+**Text frame = control / commands / telemetry (JSON, small)**. Tagged by type (the canonical key in this spec is `t`; the `type` used in the app-side code is an alias of the same field):
 
-| `t` (=`type`) | 向き | ペイロード | 備考 |
+| `t` (=`type`) | Direction | Payload | Notes |
 |---|---|---|---|
-| `hello` | phone→relay | `{deviceId, kind}` | 接続直後の宣言(本番の deviceId ルーティング用。MVP は同一 uid のため省略可) |
-| `goal` | phone→…→bridge | `{text}` | 概念B のゴール(音声はアプリで STT 済みテキスト) |
-| `intent` | phone→…→bridge | `{throttle, steer, duration_ms, look?}` | 任意の手動ナッジ。**意味値のみ**(生 `CMD_` は送らせない) |
-| `estop` | phone→…→bridge | `{on?}` | リモート緊急停止(最優先)。`on` 省略時は即停止 |
-| `arm` / `disarm` | phone→…→bridge | — | dry-run 解除／再武装(セッション毎、既定 disarm)。`dryrun {on:false/true}` と等価 |
-| `dryrun` | phone→…→bridge | `{on}` | dry-run フラグ切替(`arm`/`disarm` の明示形) |
-| `speedcap` | phone→…→bridge | `{v}` | リモート速度上限(LAN より低い既定) |
-| `heartbeat` (別名 `deadman`) | phone→…→bridge | `{seq}` または `{ts}` | 操作者デッドマン。~2〜10 Hz(アプリは ~2 Hz 監督送出。仕様上 5〜10 Hz まで許容)。途絶で bridge が STOP |
-| `telemetry` | bridge→…→phone | `{voltage, taskState, pan, tilt, observation, safetyReason, camAge}` | 状態ピル／思考表示 |
-| `observation` | bridge→…→phone | `{text, task_state}` | AI 所見(`telemetry` に同梱しても可) |
-| `status` | relay→both | `{peerUp, cold, ...}` | 相手の接続状態 |
+| `hello` | phone→relay | `{deviceId, kind}` | Declaration right after connect (for production deviceId routing; can be omitted in the MVP since it uses the same uid) |
+| `goal` | phone→…→bridge | `{text}` | Concept-B goal (voice is STT'd to text in the app) |
+| `intent` | phone→…→bridge | `{throttle, steer, duration_ms, look?}` | Optional manual nudge. **Semantic values only** (raw `CMD_` cannot be sent) |
+| `estop` | phone→…→bridge | `{on?}` | Remote emergency stop (highest priority). If `on` is omitted, stop immediately |
+| `arm` / `disarm` | phone→…→bridge | — | Dry-run release / re-arm (per session, default disarm). Equivalent to `dryrun {on:false/true}` |
+| `dryrun` | phone→…→bridge | `{on}` | Dry-run flag toggle (the explicit form of `arm`/`disarm`) |
+| `speedcap` | phone→…→bridge | `{v}` | Remote speed cap (a lower default than LAN) |
+| `heartbeat` (alias `deadman`) | phone→…→bridge | `{seq}` or `{ts}` | Operator deadman. ~2–10 Hz (the app sends supervisory at ~2 Hz; the spec allows up to 5–10 Hz). On lapse the bridge STOPs |
+| `status` (shipped) | bridge→…→phone | `{cmd, cam, goal, estop, dry_run, voltage, distance, safety, task_state, observation, pan, tilt}` | A single status/telemetry message the shipped bridge sends (folds telemetry + observation together) |
+| `ready` / `peer` | relay→one/both | `{type:"ready", role, peer}` / `{type:"peer", role, up}` | The relay tells the connecting side it's ready, and tells the other side when a peer appears/disappears |
 
-**バイナリフレーム = カメラ(生 JPEG)**。WS がメッセージ境界を持つので、TCP :7000 の **4 バイト長プレフィクスは家ブリッジで剥がす**(§B.4)。代わりに 5 バイトの小ヘッダを付す(正準形):
+> The spec above lists separate `telemetry` and `observation` frames as a design target; the shipped bridge instead sends one `status` message (see the fields above and §4-C.6).
+
+**Binary frame = camera (raw JPEG)**. Since WS has message boundaries, the **4-byte length prefix of TCP :7000 is stripped at the home bridge** (§B.4). In the canonical form a small 5-byte header is prepended:
 
 ```
 byte0      : channel   (0x01 = video JPEG)
-byte1..4   : uint32 LE  frame seq(または送出 ms 下位) — 遅延/失効判定用
-byte5..    : JPEG payload(再エンコードしない生バイト)
+byte1..4   : uint32 LE  frame seq (or low bits of send-ms) — for latency/staleness checks
+byte5..    : JPEG payload (raw bytes, not re-encoded)
 ```
 
-- phone 側は seq で古いフレームを判定・破棄でき、`VideoLink` の「最新フレームのみ」意味論をエンドツーエンドで維持する。将来別ストリーム(例: 深度可視化)を足しても channel で多重化可能。
-- phone は復号前にこの 5 バイトを剥がしてから `UIImage(data:)` に渡す。**MVP では 5 バイトヘッダを省き生 JPEG のみを送る簡略形**も可(seq 失効判定は省略)。本番では 5 バイトヘッダを標準とする。
+- The phone side can judge and discard old frames by seq, preserving the "latest frame only" semantics of `VideoLink` end-to-end. If another stream is added later (e.g. a depth overlay), it can be multiplexed by channel.
+- The phone strips these 5 bytes before decoding and passes the rest to `UIImage(data:)`. **In the MVP, a simplified form that omits the 5-byte header and sends only the raw JPEG** is used (the shipped `preview_loop` sends the raw JPEG with no header; seq-based staleness checking is skipped). In production the 5-byte header is the standard.
 
-### A.4 バックプレッシャ・再接続・keepalive
+### A.4 Backpressure, reconnection, keepalive
 
-- **バックプレッシャ(映像は捨てる、制御は捨てない)**:
-  - 映像(bridge→phone)は **latest-wins**。relay/bridge とも送信キュー長 1。`transport` の書き込みバッファが高水位(例 > 256 KB)なら**そのフレームをスキップ**して読み側を絶対にブロックしない。`host_brain` の `VideoLink`(バックログを持たない設計)と同じ思想。
-  - コマンド／estop／heartbeat(小・順序保証必須)は**別方向 or 優先**扱い。実運用では映像は下り、コマンドは上りなので**方向分離だけで HOL ブロッキングはほぼ解消**する。厳密な分離が必要になったら「制御 WS」+「メディア WS」の 2 本構成へ拡張(Cloud Run 課金は増える。当面は 1 本推奨)。
-- **keepalive**: relay は両ピアに WS ping を ~20s 間隔。pong 欠落で早期に相手断を検知 → 相手側に `peer{up:false}` を通知。**bridge は上り断／heartbeat 断を検知したら即 STOP + disarm**(リモートデッドマン)。
-- **再接続**: MVP の phone は切断から 2 秒後に再接続し、再接続ごとに fresh token を取り直す。bridge は token を期限約 1 分前に更新しつつ再接続する。指数バックオフ + ジッタ、seq 付き goal/estop 再送、Firestore ステート再構成は Phase 2 の堅牢化。
+- **Backpressure (drop video, never drop control)**:
+  - Video (bridge→phone) is **latest-wins**. Both relay and bridge keep a send-queue length of 1. If the `transport` write buffer is high-water (e.g. > 256 KB), **skip that frame** so the read side is never blocked. Same philosophy as `host_brain`'s `VideoLink` (which by design holds no backlog).
+  - Commands / estop / heartbeat (small, ordering-critical) are treated as **separate-direction or priority**. In practice video is downlink and commands are uplink, so **direction separation alone almost eliminates head-of-line blocking**. If strict separation is ever needed, extend to a "control WS" + "media WS" two-connection setup (Cloud Run billing increases; a single connection is recommended for now).
+- **keepalive**: The relay sends WS pings to both peers at ~20 s. A missing pong detects the peer drop early → notifies the other side with `peer{up:false}`. **When the bridge detects an uplink drop / heartbeat lapse, it immediately STOPs + disarms** (remote deadman).
+- **Reconnection**: In the MVP, the phone reconnects 2 seconds after a disconnect and re-fetches a fresh token on each reconnect. The bridge re-mints its token about 1 minute before expiry and reconnects. Exponential backoff + jitter, seq-tagged goal/estop retransmission, and Firestore state reconstruction are Phase-2 robustness.
 
-### A.5 Cloud Run 固有事項
+### A.5 Cloud Run specifics
 
-- **WebSocket 対応**: Cloud Run は HTTP/1.1 Upgrade による WS をサポート(ストリーミング応答)。ingress は「all」(公開)だが**認証はアプリ層(Firebase)**で行う。MVP は upgrade 後の hello で認証し、未認証なら即 close する。
-- **リクエストタイムアウト = WS 寿命の上限**: 長寿命 WS は 1 リクエスト扱いで、**最大 60 分**(`--timeout=3600`)。MVP は切断時再接続で復旧する。**~55 分で先回りグレースフル再接続**は Phase 2 の堅牢化とする。
-- **同一インスタンス共存(最重要)**: relay はプロセス内で 2 ピアを突き合わせるため、phone と bridge が**同一インスタンスに乗る必要**がある。単一家庭・単一ブリッジなら **`--max-instances=1` に固定**すれば全接続が 1 インスタンスに集約され、確実に共存する(セッションアフィニティ不要)。
+- **WebSocket support**: Cloud Run supports WS via HTTP/1.1 Upgrade (streaming responses). Ingress is "all" (public), but **authentication is at the app layer (Firebase)**. The MVP authenticates in the hello after upgrade and immediately closes if unauthenticated.
+- **Request timeout = the upper bound on WS lifetime**: A long-lived WS is treated as a single request, with a **maximum of 60 minutes** (`--timeout=3600`). The MVP recovers via reconnection on disconnect. **Pre-emptive graceful reconnect at ~55 minutes** is Phase-2 robustness.
+- **Same-instance co-location (most important)**: Because the relay matches the two peers within a single process, the phone and the bridge **must land on the same instance**. For a single household / single bridge, **pin `--max-instances=1`** so all connections consolidate on one instance and co-location is guaranteed (no session affinity needed).
 - **scale-to-zero vs min-instances**:
-  - 推奨初期値: **`min-instances=0` + `max-instances=1`**。アイドル時ゼロで課金最小、かつ max=1 で共存も保証。初回接続はコールドスタート(~1〜3s)。
-  - コールドスタートの体感やデッドマン復帰を嫌うなら **`min-instances=1`** へ。常時 1 インスタンス分の費用が乗る(WS は継続リクエストなので接続中は CPU が割り当て・課金される)。**安全上の STOP はブリッジ側で完結**するため、コールドスタートが安全性を損なうことはない(min=0 で可)。
-  - 将来の複数拠点／HA: max>1 が必要になったら**プロセス内突き合わせを外部化**(Memorystore(Redis) pub/sub か Pub/Sub、または deviceId 単位ルーティング + セッションアフィニティ)。v1.2 では単一家庭前提で max=1(OS-9)。
-- その他: `--concurrency` は既定で十分(1 家庭、実値 80 で運用)。CPU/メモリは小(256〜512 MiB)。TLS は Cloud Run のマネージド証明書で終端(phone↔relay、bridge↔relay とも WSS)。
+  - Recommended initial values: **`min-instances=0` + `max-instances=1`**. Zero when idle for minimal billing, and max=1 also guarantees co-location. The first connection incurs a cold start (~1–3 s).
+  - If you dislike the cold-start feel or the deadman recovery, move to **`min-instances=1`**. That adds the cost of one always-on instance (a WS is a continuous request, so CPU is allocated and billed while connected). Because **the safety STOP is fully handled on the bridge**, a cold start never compromises safety (min=0 is fine).
+  - Future multi-site / HA: if `max>1` becomes necessary, **externalize the in-process matching** (Memorystore (Redis) pub/sub or Pub/Sub, or per-deviceId routing + session affinity). v1.2 assumes a single household and uses max=1 (OS-9).
+- Others: `--concurrency` is fine at the default (one household; run at the actual value 80). CPU/memory small (256–512 MiB). TLS is terminated by Cloud Run's managed certificates (WSS on both phone↔relay and bridge↔relay).
 
-## B. 家ブリッジ(`host_brain` 拡張)
+## B. Home bridge (`host_brain` extension)
 
-### B.1 既存モジュールの再利用マップ
+### B.1 Reuse map of existing modules
 
-| モジュール(host_brain) | v1.2 での扱い | 変更点 |
+| Module (host_brain) | Handling in v1.2 | Changes |
 |---|---|---|
-| `car_link.py` `CommandLink` | **そのまま再利用**。:4000 の唯一のライタ | なし |
-| `car_link.py` `VideoLink` | **再利用 + 微修正** | 生 JPEG バイトを保持するフィールド追加(§B.4) |
-| `safety.py` `SafetyMonitor` | **再利用 + 拡張** | リモート起因の停止理由を追加(§D) |
-| `dispatcher.py` | **完全に不変(クランプの砦)** | なし。リモート指令も必ずここを通す |
-| `brain.py` `Brain.decide` | **再利用**(Remote 時はブリッジが頭脳、§C) | なし(プロンプト/JSON 契約はアプリと共通) |
-| `main.py` `arbiter_loop` | **再利用 + 拡張**。単一ライタを維持 | relay 由来 intent を安全経由で降下 |
+| `car_link.py` `CommandLink` | **Reused as-is**. The sole writer to :4000 | None |
+| `car_link.py` `VideoLink` | **Reused + minor tweak** | A field holding the raw JPEG bytes was added (§B.4) |
+| `safety.py` `SafetyMonitor` | **Reused + extended** | Adds remote-origin stop reasons (§D) |
+| `dispatcher.py` | **Completely unchanged (the clamping fortress)** | None. Remote commands must also pass through here |
+| `brain.py` `Brain.decide` | **Reused** (in Remote the bridge is the brain, §C) | None (prompt/JSON contract shared with the app) |
+| `main.py` `arbiter_loop` | **Reused + extended**. Keeps the single writer | Relay-origin intent is lowered via the safety path |
 
-### B.2 新規モジュール `relay_link.py`(アウトバウンド WSS クライアント)
+### B.2 New module `relay_link.py` (outbound WSS client)
 
-- Python `websockets`(または `aiohttp`)で relay へ **WSS を 1 本**張り、自動再接続(`CommandLink.run()` のリトライ構造を踏襲)。
-- 受信テキスト `goal`/`intent`/`estop`/`arm`/`dryrun`/`speedcap`/`heartbeat` を**セマンティックのまま**処理し、`goal_loop`/`brain_loop`/`arbiter_loop` と同じ経路に注入する。**生 `CMD_` は受け付けない**(受け取っても破棄)。これにより「認証済みでも車体プロトコルを生で露出しない」を担保。
-- `intent`(手動ナッジ)は `dispatcher.drive/look` を通し、`speed_cap`・デッドゾーン・tilt クランプが必ず効く。
-- 送信: `telemetry`(電圧・taskState・pan/tilt・observation・safetyReason・camAge)と**バイナリ映像**(§B.4)。
-- `main.py` の `asyncio.gather` に `relay_link.run()` と映像フォワードタスクを追加するだけで統合できる(既存イベントループに同居)。エントリは拡張 `main.py`、あるいは薄い `bridge_main.py`(§4-C.6)のいずれでもよい。
+- Opens **a single WSS** to the relay with Python `websockets` (or `aiohttp`) and auto-reconnects (following the retry structure of `CommandLink.run()`).
+- Processes received text `goal`/`intent`/`estop`/`arm`/`dryrun`/`speedcap`/`heartbeat` **as semantics** and injects them into the same path as `goal_loop`/`brain_loop`/`arbiter_loop`. **Raw `CMD_` is not accepted** (dropped even if received). This guarantees "even authenticated, never expose the car protocol on the wire raw."
+- `intent` (a manual nudge) goes through `dispatcher.drive/look`, so `speed_cap`, dead-zone, and tilt clamps always apply.
+- Sending: `status` (voltage, taskState, pan/tilt, observation, safetyReason, etc.) and **binary video** (§B.4).
+- Integration is as simple as adding `relay_link.run()` and the video-forward task to `main.py`'s `asyncio.gather` (co-resident in the existing event loop). The entry point can be either the extended `main.py` or the thin `bridge_main.py` (§4-C.6).
 
-### B.3 デバイスとしての認証(bridge のアイデンティティ)
+### B.3 Authenticating as a device (the bridge's identity)
 
-段階に応じて 2 方式(§6 で MVP→本番)。
+The shipped bridge authenticates with a **service-account custom token** (§6: MVP → production).
 
-**MVP(Email/Password 専用アカウント)**: ヘッドレスなブリッジは Apple サインイン不可のため、専用の Email/Password アカウントで Identity Toolkit REST `signInWithPassword` を叩き **ID トークン + リフレッシュトークン**を取得・更新。env に `FIREBASE_EMAIL` / `FIREBASE_PASSWORD` / `FIREBASE_WEB_API_KEY`。
+**MVP (service-account custom token)**: A headless bridge cannot do the interactive Apple sign-in, so it authenticates as the **same uid as the phone** using a service-account custom token. `firebase_auth.py` (`BridgeAuth`) calls the Admin SDK `create_custom_token(owner_uid)` — a local RS256 signature with the service-account key, no network — and exchanges it for an **ID token + refresh via Identity Toolkit REST** `signInWithCustomToken`. The token is cached and re-minted about 1 minute before expiry. This ID token is placed in the hello's `token` on the WS handshake. Config lives in `[remote]` of `config.toml`: `auth = "firebase"`, `owner_uid`, `service_account` (path to the SA JSON key), `api_key` (a Firebase Web API key for the exchange).
 
-**本番(カスタムトークン + deviceId クレーム)**:
-- **プロビジョニング**(1 回): オーナ端末(サインイン済み)が Callable Cloud Function `provisionDevice` を呼ぶ → `devices/{deviceId}` を `ownerUid` 付きで作成し、**Firebase カスタムトークン**(クレーム `{role:"bridge", deviceId, ownerUid}`)を発行。
-- **ブリッジ側**: カスタムトークンを Identity Toolkit REST(`signInWithCustomToken`)で **ID トークン + リフレッシュトークン**に交換して保存。以後はリフレッシュトークンで ID トークンを更新し、WS ハンドシェイクに添付。
-- **秘匿情報の扱い**: リフレッシュトークンはサービスアカウント鍵をベタ置きするより安全。`config.toml` にベタ書きせず、**環境変数 or OS キーチェーン**に格納(既存の「API キーは env、ハードコードしない」方針と一致)。
-- **config 追加**:
+**Production (custom token + deviceId claim)**:
+- **Provisioning** (once): The owner's device (signed in) calls a Callable Cloud Function `provisionDevice` → creates `devices/{deviceId}` with `ownerUid` and issues a **Firebase custom token** (claims `{role:"bridge", deviceId, ownerUid}`).
+- **Bridge side**: Exchanges the custom token for an **ID token + refresh token** via Identity Toolkit REST (`signInWithCustomToken`) and saves it. Thereafter it refreshes the ID token with the refresh token and attaches it to the WS handshake.
+- **Handling of secrets**: The service-account JSON key stays a git-ignored file on the home side and is never checked into the repo; `owner_uid` and `api_key` (a public Web API key) live in `config.toml`. This is consistent with the existing "API keys go in env, never hard-code" policy.
+- **Config**:
   ```toml
-  [relay]
-  url              = "wss://<cloud-run-host>/ws/bridge"
-  device_id        = "rover-livingroom-01"
-  cred_env         = "ROBOTBRAIN_DEVICE_REFRESH"   # リフレッシュトークンを持つ env 名(本番)
-  remote_speed_cap = 1800    # リモートは LAN より控えめに(任意)
+  [remote]
+  relay_url        = "wss://<your-relay>.asia-northeast1.run.app"  # pathless Cloud Run relay (role via hello)
+  room             = "dev"                    # only used when auth = "dev" (AUTH_DISABLED local relay)
+  token            = ""                        # unused when auth = "firebase"
+  preview_hz       = 4                         # JPEG preview frames/sec sent to the phone
+  status_hz        = 2                         # telemetry/status messages/sec sent to the phone
+  auth             = "firebase"                # "firebase" (prod wss relay) | "dev" (local AUTH_DISABLED room)
+  owner_uid        = ""                        # the uid the iOS app shows after Sign in with Apple
+  service_account  = "service-account.json"    # bridge's service-account JSON key (git-ignored)
+  api_key          = ""                        # a Firebase Web API key (Identity Toolkit token exchange)
+  # device_id / remote_speed_cap: Phase 2 (per-device routing, a distinct remote cap) — not yet implemented.
   ```
-  秘密(リフレッシュトークン／パスワード／OpenAI キー)は env/キーチェーン、非秘密設定(url/device_id/remote_speed_cap)は `config.toml` に置く。
+  Secrets (the service-account JSON file, the VLM provider key) stay in a git-ignored file / env; non-secret settings (relay_url / owner_uid / preview_hz / …) live in `config.toml`.
 
-### B.4 映像フォワード(再エンコードなし)
+### B.4 Video forwarding (no re-encode)
 
-- 現状 `VideoLink` は `cv2.imdecode` で BGR に復号し、**元 JPEG バイトを捨てている**。フォワード用に **復号前の `buf` を `latest_jpeg`(+ seq/ts)として保持**する 1 行追加を行う。
-- フォワードタスクは `latest_jpeg` を §A.3 のバイナリフレーム(5 バイトヘッダ + JPEG)として relay へ送出。**再エンコードしない**(CPU 節約・画質維持)。
-- Remote で頭脳がブリッジ側の場合、BGR 復号は `brain.decide` が必要とするので継続。頭脳がアプリ側の運用(非推奨、§C)では復号をスキップして純フォワードにでき、CPU をさらに節約できる(config フラグで切替)。
-- 見る用ストリームは**知覚レートと独立に間引ける**(例: 送出上限 fps・JPEG 品質を relay/bridge 側で絞る、実測 2〜5 fps)。宅内アップリンクとユーザのモバイル通信量を守るための重要ポイント(RNFR-6)。
+- Currently `VideoLink` decodes to BGR with `cv2.imdecode` and **discards the original JPEG bytes**. For forwarding, add a single line to **keep the pre-decode `buf` as `jpeg` (+ ts)**.
+- The forward task sends `jpeg` to the relay as the binary frame of §A.3 (5-byte header + JPEG in production; raw JPEG in the MVP). It **does not re-encode** (saving CPU, preserving quality).
+- Since in Remote the brain is on the bridge, the BGR decode is still needed by `brain.decide` and continues. In a brain-on-app configuration (not recommended, §C) the decode could be skipped for a pure forward, saving even more CPU (switchable by a config flag).
+- The viewing stream can be **thinned independently of the perception rate** (e.g. cap the send fps / JPEG quality on the relay/bridge side; in practice 2–5 fps). This is a key point for protecting the home uplink and the user's mobile data (RNFR-6).
 
-### B.5 アービタ単一ライタの堅持
+### B.5 Keeping the arbiter as the single writer
 
-`arbiter_loop` は引き続き **:4000 への唯一のライタ**。リモート由来の `goal`/`intent` も、ローカルの `brain_loop`/`goal_loop` とまったく同じく `SafetyMonitor.want_stop()`・`dry_run`・`speed_cap`・パルス自己満了を経由してから降下する。リモートだからといってバイパス経路を作らない(暴走面の最小化)。
+`arbiter_loop` remains **the sole writer to :4000**. Remote-origin `goal`/`intent` also pass through `SafetyMonitor.want_stop()`, `dry_run`, `speed_cap`, and pulse self-expiry exactly like the local `brain_loop`/`goal_loop` before being lowered. Being remote does not create a bypass path (minimizing the runaway surface).
 
-## C. 設計判断: Remote 時、脳はどこで動くか
+## C. Design decision: in Remote, where does the brain run?
 
-**結論: Remote モードでは脳をホームブリッジで走らせる(案B)。アプリはシンクライアント(監督者)になる。** LAN モードは従来どおりアプリ内 `Brain`(案A = onDevice)。
+**Conclusion: In Remote mode, run the brain on the home bridge (option B). The app becomes a thin client (supervisor).** LAN mode stays as the in-app `Brain` (option A = onDevice).
 
-| 観点 | 案A アプリ内脳(映像が phone↔雲を往復) | **案B ブリッジ脳(推奨)** |
+| Aspect | Option A: brain in the app (video round-trips phone↔cloud) | **Option B: brain on the bridge (recommended)** |
 |---|---|---|
-| **帯域** | 車→ブリッジ→雲→電話(下り)で**知覚レート全フレーム**(240×176 JPEG ≈ 5〜15 KB × 10〜15 fps ≈ 0.5〜1.5 Mbps)を宅内アップリンク+電話下りに流し続ける。判断フレームも上り往復。 | 知覚フレームは**車↔ブリッジの LAN 内(ms)**に留まる。雲へ出るのは**間引いた閲覧用プレビュー**(2〜5 fps ≈ 0.1〜0.2 Mbps、RNFR-6 予算内)+ 小さなテキストのみ。OpenAI 呼び出しはブリッジ→OpenAI 直(宅内固定回線、モバイル従量を使わない)。 |
-| **レイテンシ / 安全** | 知覚→判断→駆動の閉ループが WWAN を 2 回横断(+150〜600 ms)。0.7 Hz 判断ごとにフレーム下り+`Intent` 上りが 2 回クラウドを横断。`vision_stale_ms=800` / `deadman_ms=500` の予算を食い潰し、常時セーフティ停止に陥りやすい。phone/回線の瞬断で走行中の車が宙ぶらりん。 | **タイトな制御ループは完全に LAN ローカル**(車↔ブリッジ↔OpenAI、高速・決定的)。WWAN を渡るのは緩い「人間の監督ループ」(プレビュー+e-stop+heartbeat)だけ。停止権限(デッドマン/estop/vision-stale)が**車の最寄り**に同居 → 見えない相手を止める確実性が高い。監督リンク断は安全側(ブリッジ deadman が停止)。 |
-| **コスト** | Cloud Run 下り egress が全映像分に膨らむ(課金増)。全フレームが宅内上り+モバイル下り。 | プレビューのみ → egress 最小。OpenAI キーはブリッジに 1 つ(アプリに同梱しない)。API 呼び出しは宅内ブロードバンドから。 |
-| **単純性 / 再利用** | アプリ内 `Brain.swift` 再利用(RobotController 無改修)だが、頭脳を Swift と Python で**二重保守**。 | **`host_brain` の `brain.py`+`safety.py`+arbiter を丸ごと再利用**。既存の検証済み制御コードがそのままリモート経路になる。実装・プロンプト・プロバイダ設定を一本化。認知ループの Python 化が初期コスト(ただし `host_brain` は既に Python)。 |
+| **Bandwidth** | Streams **every perception-rate frame** (240×176 JPEG ≈ 5–15 KB × 10–15 fps ≈ 0.5–1.5 Mbps) car→bridge→cloud→phone (downlink), continuously loading the home uplink + phone downlink. Decision frames also round-trip uplink. | Perception frames stay **inside the car↔bridge LAN (ms)**. Only a **thinned viewing preview** (2–5 fps ≈ 0.1–0.2 Mbps, within the RNFR-6 budget) + small text leaves for the cloud. The VLM call is bridge→provider directly (over the home fixed line, not metered mobile). |
+| **Latency / safety** | The perceive→decide→drive closed loop crosses WWAN twice (+150–600 ms). Every 0.7 Hz decision sends a frame down + `Intent` up across the cloud twice. It eats into the `vision_stale_ms=800` / `deadman_ms=500` budgets and easily falls into constant safety stops. A momentary phone/line drop leaves a moving car dangling. | **The tight control loop is entirely LAN-local** (car↔bridge↔provider; fast and deterministic). Only the loose "human supervision loop" (preview + e-stop + heartbeat) crosses WWAN. Stop authority (deadman / estop / vision-stale) is co-located **nearest the car** → high certainty of stopping a car you cannot see. A supervisory-link drop fails safe (the bridge deadman stops). |
+| **Cost** | Cloud Run downlink egress balloons to the full video (higher billing). Every frame goes home-uplink + mobile-downlink. | Preview only → minimal egress. One VLM provider key on the bridge (not bundled in the app). API calls go from home broadband. |
+| **Simplicity / reuse** | Reuses the in-app `Brain.swift` (no RobotController change), but the brain must be **maintained twice** in Swift and Python. | **Reuses `host_brain`'s `brain.py` + `safety.py` + arbiter wholesale**. The existing, validated control code becomes the remote path as-is. Implementation, prompt, and provider config are unified. Porting the cognition loop to Python is an upfront cost (but `host_brain` is already Python). |
 
-案B は「ESP32 をクラウドに直結させない／ブリッジで `host_brain` を再利用する」という本プロジェクトの前提と完全に一致する。案A は「Brain/RobotController 無改修」を満たすが帯域・安全で不利。
+Option B aligns completely with this project's premises: "never connect the ESP32 directly to the cloud / reuse `host_brain` on the bridge." Option A satisfies "no change to Brain/RobotController" but is disadvantaged on bandwidth and safety.
 
-**帰結と割り切り**: これで LAN=アプリ脳(Swift)、Remote=ブリッジ脳(Python)の**2 実装**が併存する。両者は**同一の `SYSTEM_PROMPT`・`Intent` JSON スキーマ**を共有して契約を一致させる。案A は将来のフォールバックとして transport 抽象化(§3-B-2)の中に温存する。将来的には LAN でもアプリを常にブリッジのクライアントにして脳をブリッジへ一本化する(`Brain.swift` を撤去)のが理想だが、変更が大きいため v1.2 の範囲外。v1.2 は LAN/Remote トグルが「トランスポート + 脳の所在」を切り替える形にとどめる。
+**Consequence and trade-off**: This leaves **two implementations** coexisting — LAN = app brain (Swift), Remote = bridge brain (Python). The two share the **same `SYSTEM_PROMPT` and `Intent` JSON schema** so the contract stays consistent. Option A is preserved as a future fallback inside the transport abstraction (§3-B-2). Ideally, in the future the app would always be a bridge client even on LAN, unifying the brain onto the bridge (removing `Brain.swift`), but that is a large change and out of scope for v1.2. v1.2 keeps the LAN/Remote toggle switching "transport + location of the brain."
 
 ---
 
-# 3. アプリ改修
+# 3. App changes
 
-**既存 LAN 動作(追補 v1.1)は一切壊さない。** `CarLink` の公開 API を保ったまま内部を transport 差し替え式にし、`RobotController`/`Brain` の制御ループ・アービタ・安全ロジックは §B-4 の `brainSite` ゲート以外**無改修**とする。
+**Existing LAN operation (addendum v1.1) is left completely intact.** Keep `CarLink`'s public API and make the internals transport-swappable; `RobotController`/`Brain`'s control loop, arbiter, and safety logic are **unchanged** except for the `brainSite` gate of §B-4.
 
-## B-1. モード列挙 + Settings トグル + ステータス
+## B-1. Mode enum + Settings toggle + status
 
 ```swift
-enum LinkMode: String, Codable { case lan, remote }   // Settings のトグル
-enum BrainSite { case onDevice, onBridge }            // lan→onDevice, remote→onBridge(既定)
+enum LinkMode: String, Codable { case lan, remote }   // the Settings toggle
+enum BrainSite { case onDevice, onBridge }            // lan→onDevice, remote→onBridge (default)
 ```
 
-- `RobotController` に `@Published var linkMode: LinkMode { didSet { save(...) } }`(既定 `.lan`)を追加。`ConfigView` の車体セクションに `Picker("settings.linkMode", selection: $ctl.linkMode)`(LAN / Remote)を追加。
-- ステータスピル(`statusPill`)にモードバッジを追加: `LAN` / `REMOTE`。リモート時は色を変え、`DRY` バッジと併せ「見えない車を動かしている」ことを常時明示。
-- 新規ローカライズキー(両 `.strings` に対で): `settings.linkMode` / `mode.lan` / `mode.remote` / `settings.section.account` / `account.signIn` / `account.signOut` / `account.signedInAs` / `status.remoteConnecting` / `status.remoteLinkDown` / `safety.operatorLinkLost`。
+- Add `@Published var linkMode: LinkMode { didSet { save(...) } }` (default `.lan`) to `RobotController`. Add `Picker("settings.linkMode", selection: $ctl.linkMode)` (LAN / Remote) to the car section of `ConfigView`.
+- Add a mode badge to the status pill (`statusPill`): `LAN` / `REMOTE`. In Remote, change the color and, together with the `DRY` badge, make it always explicit that "you are moving a car you cannot see."
+- New localization keys (in pairs in both `.strings`): `settings.linkMode` / `mode.lan` / `mode.remote` / `settings.section.account` / `account.signIn` / `account.signOut` / `account.signedInAs` / `status.remoteConnecting` / `status.remoteLinkDown` / `safety.operatorLinkLost`.
 
-## B-2. Transport 抽象化(CarLink の公開 API は不変)
+## B-2. Transport abstraction (CarLink's public API unchanged)
 
-`CarLink` の現行公開面 — `connect(host:)` / `stop()` / `send(_:)` / `onCommandReady` / `@Published image, lastFrameAt, cmdConnected, camConnected, voltage` — をそのまま保ち、内部を transport 差し替え式にする。
+Keep `CarLink`'s current public surface — `connect(host:)` / `stop()` / `send(_:)` / `onCommandReady` / `@Published image, lastFrameAt, cmdConnected, camConnected, voltage` — and make the internals transport-swappable.
 
 ```swift
 protocol CarTransport: AnyObject {
     func start()
     func stop()
-    func send(_ line: String)           // CMD_ 文字列(LAN/案A)or 制御 JSON(案B)
-    var onReady: (() -> Void)? { get set }         // → CarLink.onCommandReady に橋渡し
+    func send(_ line: String)           // CMD_ string (LAN/option A) or control JSON (option B)
+    var onReady: (() -> Void)? { get set }         // → bridged to CarLink.onCommandReady
     var onFrame: ((UIImage) -> Void)? { get set }  // → CarLink.image
-    var onReply: ((String) -> Void)? { get set }   // → parseReplies(CMD_POWER 等/telemetry)
+    var onReply: ((String) -> Void)? { get set }   // → parseReplies (CMD_POWER etc / telemetry)
     var cmdUp: Bool { get }
     var camUp: Bool { get }
 }
 ```
 
-- **`LANTransport`**: 現行 `CarLink` の TCP :4000/:7000 実装をそのまま移設(挙動同一・追補 v1.1 の mDNS 発見も温存)。
-- **`RelayTransport`**: `URLSessionWebSocketTask` で単一 WSS をリレーに張る。多重化は WS メッセージ型で demux —
-  - `.string`(JSON) = 制御プレーン/テレメトリ/observation
-  - `.data`(バイナリ) = プレビュー JPEG フレーム(5 バイトヘッダを剥がして `UIImage(data:)`)
-  - 現行 MVP は接続直後の hello JSON に `token` を含めて認証する。将来強化では `Authorization: Bearer <FirebaseIDToken>` ヘッダへ移行できる。どちらの場合も URL クエリにトークンを載せない。
-- `CarLink` は `linkMode`(と Firebase トークンプロバイダ)を受けて `connect()` で適切な transport を生成。`send/image/cmdConnected/...` はどちらでも同一に動く。→ これで**案A(CMD_ をそのままトンネル)は追加コストほぼゼロで成立**し、RobotController 無改修フォールバックになる。
+- **`LANTransport`**: Port the current `CarLink` TCP :4000/:7000 implementation as-is (identical behavior; the mDNS discovery of addendum v1.1 is preserved).
+- **`RelayTransport`**: Open a single WSS to the relay with `URLSessionWebSocketTask`. Demux by WS message type —
+  - `.string` (JSON) = control plane / telemetry / observation
+  - `.data` (binary) = preview JPEG frame (strip the 5-byte header, then `UIImage(data:)`)
+  - The current MVP authenticates by including `token` in the hello JSON right after connect. A future hardening can move to an `Authorization: Bearer <FirebaseIDToken>` header. In either case the token is never placed in the URL query.
+- `CarLink` takes `linkMode` (and a Firebase token provider) and creates the appropriate transport in `connect()`. `send/image/cmdConnected/...` behave identically for either. → This makes **option A (tunnel CMD_ as-is) essentially zero additional cost**, a no-change RobotController fallback.
 
-## B-3. Firebase Auth サインイン + トークン保管
+## B-3. Firebase Auth sign-in + token storage
 
-- SwiftUI に `AuthStore`(ObservableObject)を追加。**Sign in with Apple(ネイティブ `ASAuthorizationController` + Firebase `OAuthProvider`/nonce)を主、Email/Password を副**とする。サインイン状態を `RobotBrainApp` 起動時に `FirebaseApp.configure()` で復元。
-- **ID トークンは Keychain に保管**(§8 の平文 UserDefaults より強い扱い。トークンは資格情報なので Keychain 必須)。`Auth.auth().currentUser?.getIDToken()` は期限(1h)前に自動更新 → `RelayClient` は接続直前にトークンを取り直して hello に載せる。定期的な先回り再接続は Phase 2。
-- 未サインイン時はリモートモードを選べない/接続しない(車プロトコルを無認証で晒さない)。`ConfigView` に Account セクション(サインイン/サインアウト、`account.signedInAs`)。
-- XcodeGen(`project.yml`)追加:
+- Add `AuthStore` (ObservableObject) to SwiftUI. **Prefer Sign in with Apple (native `ASAuthorizationController` + Firebase `OAuthProvider`/nonce); Email/Password is secondary.** Restore sign-in state on `RobotBrainApp` launch with `FirebaseApp.configure()`.
+- **Store the ID token in the Keychain** (stronger than the plaintext UserDefaults of §8; a token is a credential, so the Keychain is mandatory). `Auth.auth().currentUser?.getIDToken()` auto-refreshes before expiry (1h) → `RelayClient` re-fetches the token right before connecting and places it in the hello. Periodic pre-emptive reconnection is Phase 2.
+- When not signed in, Remote mode cannot be selected/connected (never expose the car protocol unauthenticated). Add an Account section to `ConfigView` (sign in/out, `account.signedInAs`).
+- XcodeGen (`project.yml`) additions:
   ```yaml
   packages:
     Firebase: { url: https://github.com/firebase/firebase-ios-sdk, from: "11.0.0" }
@@ -352,142 +361,151 @@ protocol CarTransport: AnyObject {
         properties:
           com.apple.developer.applesignin: [Default]
   ```
-  `GoogleService-Info.plist`(Firebase コンソールで bundle id `com.example.robotbrainai` を登録して取得)を `ios_app/` に置く。**`.gitignore` に追加**(API 情報を含むため)。
+  Place `GoogleService-Info.plist` (obtained by registering bundle id `com.example.robotbrainai` in the Firebase console) into `ios_app/`. **Add it to `.gitignore`** (it contains API info).
 
-## B-4. 案B のシンクライアント動作(RobotController の限定改修)
+## B-4. Option-B thin-client behavior (limited RobotController change)
 
-`brainSite == .onBridge`(= リモート)時のみ:
-- `maybeDecide()` は即 return(アプリ内脳を止める。脳はブリッジ)。
-- モーター arbiter は `CMD_` を出さない(モーター権限はブリッジ)。代わりに `setGoal`/`emergencyStop`/`dryRun`/`speedCap` は**制御メッセージ**として送信。`car.image` はプレビュー、`car.voltage`/`curPan`/`report`/`taskState`/`statusKey` はブリッジからのテレメトリ/observation で更新。
-- **監督デッドマン**: 電話は ~2 Hz で `heartbeat`(=`deadman`)を送る。ブリッジは「新鮮な操作者ハートビート」が無い間は駆動を許可しない(`safety.operatorLinkLost`)。既存のローカル deadman/vision-stale/low-batt(`safety.py`)はブリッジで従来どおり作動。
+Only when `brainSite == .onBridge` (= Remote):
+- `maybeDecide()` returns immediately (stop the in-app brain; the brain is on the bridge).
+- The motor arbiter emits no `CMD_` (motor authority is on the bridge). Instead, `setGoal`/`emergencyStop`/`dryRun`/`speedCap` are sent as **control messages**. `car.image` is the preview, and `car.voltage`/`curPan`/`report`/`taskState`/`statusKey` are updated from the bridge's telemetry/observation.
+- **Supervisory deadman**: The phone sends `heartbeat` (= `deadman`) at ~2 Hz. The bridge does not permit drive while there is no "fresh operator heartbeat" (`safety.operatorLinkLost`). The existing local deadman/vision-stale/low-batt (`safety.py`) continue to work on the bridge as before.
 
-**電話↔ブリッジ プロトコル(WSS 上、リレーは素通し)** — §2-A.3 の正準フレーミングに準拠。MVP の最小セット:
+**Phone↔bridge protocol (over WSS, the relay passes through)** — conforms to the canonical framing of §2-A.3. The shipped minimal set:
 
 ```
 Phone → Bridge : {"t":"goal","text":...} | {"t":"estop","on":bool}
                  {"t":"dryrun","on":bool} | {"t":"speedcap","v":int}
-                 {"t":"heartbeat","seq":...}  (~2Hz, 別名 deadman)
-Bridge → Phone : <binary JPEG preview>  (2–5fps, 5バイトヘッダ付/任意で縮小)
-                 {"t":"telemetry","voltage":..,"pan":..,"tilt":..,"safety":".."}
-                 {"t":"observation","text":..,"task_state":..}
+                 {"t":"heartbeat","seq":...}  (~2Hz, alias deadman)
+Bridge → Phone : <binary JPEG preview>  (2–5fps; raw JPEG in the MVP, 5-byte header in production)
+                 {"t":"status","voltage":..,"pan":..,"tilt":..,"safety":..,
+                  "task_state":..,"observation":..,"cmd":..,"cam":..,"goal":..,
+                  "estop":..,"dry_run":..,"distance":..}
 ```
 
-## B-5. モード切替のグレースフルさ
+## B-5. Gracefulness of mode switching
 
-- 切替時: 現 transport を `stop()`(必ず `CMD_MOTOR#0#0#0` 相当で車を停止)→ dry-run を強制 ON に戻す(FR-39/47、起動時と同じ安全既定)→ 新 transport で `connect()`。
-- リモート接続の状態表示: `status.remoteConnecting` → 接続確立 → `status.driving/hold`。WSS 断は `status.remoteLinkDown`(かつブリッジ側 deadman で車は自律停止)。
-- LAN に戻すとブリッジ不要で従来スタンドアロン動作(アプリ内脳)。
+- On switch: `stop()` the current transport (always stop the car with the `CMD_MOTOR#0#0#0` equivalent) → force dry-run back ON (FR-39/47, the same safety default as at launch) → `connect()` with the new transport.
+- Remote connection status display: `status.remoteConnecting` → connection established → `status.driving/hold`. A WSS drop shows `status.remoteLinkDown` (and the bridge-side deadman autonomously stops the car).
+- Switching back to LAN restores the standalone behavior (in-app brain) with no bridge needed.
 
-## B-6. リモート運用の安全(必須・見えない車を動かす)
+## B-6. Safety of remote operation (required; moving a car you cannot see)
 
-dry-run 既定 ON(毎起動リセット)/ 常設リモート e-stop(即時制御メッセージ + WSS 断でブリッジ自律停止)/ 二重デッドマン(操作者ハートビート + ローカル intent 鮮度)/ vision-stale・low-batt はブリッジローカル反射 / リモート時は `speedCap` を低めの既定に / dry-run 解除は毎セッション明示操作を要求 / REMOTE+DRY バッジ常時表示。
+Dry-run ON by default (reset every launch) / a permanent remote e-stop (immediate control message + bridge autonomous stop on WSS drop) / twin deadman (operator heartbeat + local intent freshness) / vision-stale and low-batt as bridge-local reflexes / a lower `speedCap` default in Remote / dry-run release requires an explicit action every session / the REMOTE+DRY badge always visible.
 
 ---
 
-# 4. GCP デプロイ手順(`YOUR-GCP-PROJECT`)
+# 4. GCP deploy procedure (`YOUR-GCP-PROJECT`)
 
-## C-1. リレーコンテナ(Cloud Run, Python)
+## C-1. Relay container (Cloud Run, Python)
 
-役割: 両ピアを Firebase ID トークンで認証し、**同一 `uid`(=ペア)同士だけ**をバイト単位で素通しブリッジ。生の `CMD_` TCP はクラウドに一切出さない(ブリッジで終端)。トークン無し接続は即拒否 → 無認証で車プロトコルを晒さない。
+Role: authenticate both peers with a Firebase ID token and byte-forward **only between the same `uid` (= pair)**. Raw `CMD_` TCP never leaves for the cloud (terminated at the bridge). A tokenless connection is immediately rejected → the car protocol is never exposed unauthenticated.
 
-`relay/main.py`(FastAPI + WebSocket, MVP スケッチ):
+The shipped relay is `relay/server.py` — **plain `websockets` + `firebase-admin`** (no FastAPI/uvicorn). It is **pathless**: the role comes from the `role` field in the hello JSON, and the URL path is ignored. Auth is via `hello.token`, verified with `verify_id_token`; close codes are `4000` (no hello), `4001` (bad role), `4003` (auth failed), `4009` (a same-role socket replaced by a newer connection). There is **no allowlist** — the room is the verified `uid`, and only a phone and a bridge sharing that uid are bridged. `AUTH_DISABLED=1` skips Firebase auth and uses `hello.room` (local dev only).
+
+Shape of `relay/server.py` (essentials):
 ```python
-import os, asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import firebase_admin; from firebase_admin import auth
-firebase_admin.initialize_app()          # Cloud Run 上は ADC で projectId 自動検出
-app = FastAPI(); rooms: dict[str, dict] = {}   # uid -> {"phone":ws,"bridge":ws}
-ALLOWED = set(filter(None, os.getenv("ALLOWED_UIDS","").split(",")))
+import asyncio, json, os
+import websockets
 
-@app.websocket("/ws/{role}")             # role = phone | bridge
-async def ws(sock: WebSocket, role: str):
-    tok = (sock.headers.get("authorization","")).removeprefix("Bearer ").strip()
-    try:
-        uid = auth.verify_id_token(tok)["uid"]        # 署名/aud/iss を検証
-    except Exception:
-        await sock.close(code=4401); return
-    if ALLOWED and uid not in ALLOWED:
-        await sock.close(code=4403); return
-    await sock.accept()
-    room = rooms.setdefault(uid, {}); room[role] = sock
-    try:
-        while True:
-            msg = await sock.receive()               # text or bytes
-            peer = room.get("bridge" if role=="phone" else "phone")
-            if not peer: continue
-            if "text" in msg and msg["text"] is not None:
-                await peer.send_text(msg["text"])
-            elif msg.get("bytes") is not None:
-                await peer.send_bytes(msg["bytes"])
-    except WebSocketDisconnect:
-        room.pop(role, None)
+AUTH_DISABLED = os.environ.get("AUTH_DISABLED") == "1"
+PORT = int(os.environ.get("PORT", "8080"))
+if not AUTH_DISABLED:
+    import firebase_admin
+    from firebase_admin import auth as fb_auth
+    firebase_admin.initialize_app()          # ADC on Cloud Run (project auto-detected)
+
+rooms: dict[str, dict] = {}                   # uid -> {"phone": ws, "bridge": ws}
+
+async def handler(ws):
+    hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))   # first frame = hello
+    role = hello.get("role")
+    if role not in ("bridge", "phone"):
+        return await ws.close(code=4001, reason="bad role")
+    if AUTH_DISABLED:
+        uid = str(hello.get("room", "dev"))
+    else:
+        try:
+            uid = fb_auth.verify_id_token(hello.get("token", ""))["uid"]
+        except Exception:
+            return await ws.close(code=4003, reason="auth failed")
+    room = rooms.setdefault(uid, {}); room[role] = ws          # register; peer = the other role
+    peer_role = "phone" if role == "bridge" else "bridge"
+    async for msg in ws:
+        peer = rooms.get(uid, {}).get(peer_role)
+        if peer is not None:
+            await peer.send(msg)              # opaque forward (str or bytes)
+
+async def main():
+    async with websockets.serve(handler, "0.0.0.0", PORT,
+                                max_size=8 * 1024 * 1024,      # allow ~JPEG frames
+                                ping_interval=20, ping_timeout=20):
+        await asyncio.Future()
 ```
-`requirements.txt`: `fastapi`, `uvicorn[standard]`, `firebase-admin`。起動: `uvicorn main:app --host 0.0.0.0 --port 8080`。
+`relay/requirements.txt`: `websockets`, `firebase-admin`. Start: `python server.py` (Cloud Run sets `$PORT`; the server reads it — see `relay/Dockerfile`).
 
-**重要:** Cloud Run はマルチインスタンスだと両ピアが別インスタンスに着地し得る。個人利用(単一ペア)は **`--max-instances 1`** で確実に同居させる(セッションアフィニティ不要)。トークン検証は同一 GCP プロジェクトなら ADC で projectId 自動検出でき、**リレー側にシークレット鍵ファイル不要**。
+**Important:** With multiple Cloud Run instances the two peers could land on different instances. For personal use (a single pair), **`--max-instances 1`** guarantees co-location (no session affinity needed). Token verification works via ADC (project auto-detected) as long as it's the same GCP project, so **the relay needs no secret key file**.
 
-## C-2. gcloud デプロイ手順
+## C-2. gcloud deploy procedure
 
 ```bash
 gcloud config set project YOUR-GCP-PROJECT
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
   artifactregistry.googleapis.com identitytoolkit.googleapis.com
 
-# ソースから直接デプロイ(Cloud Build が自動ビルド)。東京リージョン。
+# Deploy directly from source (Cloud Build builds automatically). Tokyo region.
 gcloud run deploy robot-relay \
   --source ./relay --region asia-northeast1 --port 8080 \
-  --allow-unauthenticated \        # ← IAM 層は開放。認証は Firebase トークン(アプリ層)で担保
-  --timeout 3600 \                 # WS は長寿命リクエスト。最大 60 分
+  --allow-unauthenticated \        # ← IAM layer open. Auth is the Firebase token (app layer)
+  --timeout 3600 \                 # WS is a long-lived request. Max 60 min
   --min-instances 0 --max-instances 1 --concurrency 80 \
-  --cpu 1 --memory 256Mi \
-  --set-env-vars "ALLOWED_UIDS=<phone/bridge の uid>"
+  --cpu 1 --memory 256Mi
 ```
-- `--allow-unauthenticated` は必須(電話/ブリッジは IAM 資格を持てない)。その代わり**必ずアプリ層 Firebase 検証で門番**する。
-- 返る URL 例 `https://robot-relay-xxxx.a.run.app` → アプリ/ブリッジは `wss://robot-relay-xxxx.a.run.app/ws/phone`(または `/ws/bridge`)。
-- デプロイは cloud-run MCP または上記 `gcloud run deploy`(コンテナに `firebase-admin` 同梱)。
+- `--allow-unauthenticated` is required (the phone/bridge cannot hold IAM credentials). Instead, **always gate at the app layer with Firebase verification**. The relay needs **no environment variables or secrets** (token verification uses ADC); `AUTH_DISABLED=1` is only for local dev.
+- Returned URL example `https://robot-relay-xxxx.a.run.app` → the app/bridge connect to `wss://robot-relay-xxxx.a.run.app` (pathless; the role is declared in the hello, not in the path).
+- Deploy via the cloud-run MCP or the `gcloud run deploy` above (the container bundles `firebase-admin`).
 
-## C-3. Firebase Auth セットアップ
+## C-3. Firebase Auth setup
 
-1. Firebase コンソールで既存 GCP プロジェクト `YOUR-GCP-PROJECT` を「Firebase に追加」。
-2. Authentication を有効化。プロバイダ:
-   - **Email/Password**(ブリッジ用の専用アカウントに使う。ヘッドレスは Apple サインイン不可)。
-   - **Apple**(電話用。Apple Developer で Services ID・Team ID・Key ID・.p8 秘密鍵を作成しコンソールに登録。ネイティブ Sign in with Apple は nonce 必須)。
-3. iOS アプリ(bundle `com.example.robotbrainai`)を登録し `GoogleService-Info.plist` を取得。
-4. **ペアリング(最小構成 = MVP)**: ブリッジを**電話と同一の Firebase アカウント**でサインインさせる → リレーは同一 `uid` 同士を自動ペア。本番では `devices/{deviceId}` + Callable `provisionDevice`(カスタムトークン)へ移行し、メッセージに `deviceId`/ペアコードを足す。
+1. In the Firebase console, "Add Firebase to" the existing GCP project `YOUR-GCP-PROJECT`.
+2. Enable Authentication. Provider:
+   - **Apple** (for the phone; in Apple Developer create a Services ID, Team ID, Key ID, and .p8 private key and register them in the console. Native Sign in with Apple requires a nonce).
+   - The bridge does **not** need an interactive provider: it authenticates as the same uid via a **service-account custom token** (Admin SDK), so no Email/Password account is required. (Email/Password may still be enabled as a secondary phone sign-in if desired.)
+3. Register the iOS app (bundle `com.example.robotbrainai`) and obtain `GoogleService-Info.plist`.
+4. **Pairing (minimal = MVP)**: The bridge signs in as the **same `uid` as the phone** via a service-account custom token → the relay auto-pairs the same `uid`. In production, migrate to `devices/{deviceId}` + a Callable `provisionDevice` (custom token) and add `deviceId`/a pairing code to the messages.
 
-## C-4. 環境変数 / シークレット
+## C-4. Environment variables / secrets
 
-| 場所 | 値 | 保管 |
+| Location | Value | Storage |
 |---|---|---|
-| リレー(Cloud Run) | `ALLOWED_UIDS`(任意の許可リスト) | env var。**鍵ファイル不要**(ADC でトークン検証) |
-| ブリッジ(自宅) | `OPENAI_API_KEY` | `.env`/Keychain、`chmod 600`。リポジトリ/アプリに置かない |
-| ブリッジ | Firebase ブリッジアカウントの email/password + Web API キー | 同上。REST `signInWithPassword` で idToken+refreshToken 取得・更新 |
-| ブリッジ | `RELAY_WSS_URL` | `wss://robot-relay-xxxx.a.run.app/ws/bridge` |
-| アプリ | Firebase 設定 | `GoogleService-Info.plist`(git 無視)。ID トークンは Keychain |
+| Relay (Cloud Run) | none — no secrets | Token verification uses ADC (the Cloud Run service's default credentials); **no key file**. `AUTH_DISABLED=1` only for local dev |
+| Bridge (home) | VLM provider API key (env var named by `[brain].api_key_env`, e.g. `GEMINI_API_KEY`) | `.env`/Keychain, `chmod 600`. Never in the repo or the app |
+| Bridge (home) | Firebase service-account JSON key + `owner_uid` + Firebase Web API key | The service-account JSON is a **git-ignored file** referenced by `[remote].service_account`; `owner_uid` and `api_key` live in `config.toml`. The bridge mints a custom token for `owner_uid` and exchanges it for an ID token |
+| Bridge (home) | `relay_url` | `config.toml` `[remote].relay_url` (pathless, `wss://robot-relay-xxxx.a.run.app`) — not an env var |
+| App | Firebase config | `GoogleService-Info.plist` (git-ignored). ID token in the Keychain |
 
-Firebase Web API キーはアプリに埋まる公開値で秘密ではない。**真に秘密なのはブリッジアカウントのパスワードと OpenAI キーだけ** → 自宅側にのみ置く。
+The Firebase Web API key is a public value baked into the app; it is not a secret. **The only truly secret items are the bridge's service-account JSON key and the VLM provider key** → keep them on the home side only.
 
-## C-5. 概算コスト(個人利用)
+## C-5. Rough cost (personal use)
 
-Cloud Run 無料枠(月): 180,000 vCPU 秒 / 360,000 GiB 秒 / 200 万リクエスト。Firebase Auth(Spark)無料。Artifact Registry・Cloud Build はほぼ無視できる(<$0.1)。
+Cloud Run free tier (monthly): 180,000 vCPU-seconds / 360,000 GiB-seconds / 2 million requests. Firebase Auth (Spark) free. Artifact Registry / Cloud Build are negligible (<$0.1).
 
-| 利用形態 | 月額目安 |
+| Usage pattern | Monthly estimate |
 |---|---|
-| **オンデマンド**(リモート運転時だけブリッジが WSS 接続、例 ~20h/月) | vCPU ≈ 72,000 秒 → **無料枠内**。プレビュー egress ~1〜2 GB ≈ $0.1〜0.2。→ **実質 $0〜1** |
-| 常時接続(ブリッジが 24/7 WSS 保持) | 1 vCPU 常時 ≈ 2.59M 秒 − 無料枠 → **約 $55〜65/月**(`--cpu 0.5` で ~$29)。非推奨 |
+| **On-demand** (the bridge connects WSS only during remote driving, e.g. ~20h/month) | vCPU ≈ 72,000 s → **within the free tier**. Preview egress ~1–2 GB ≈ $0.1–0.2. → **effectively $0–1** |
+| Always-on (the bridge holds WSS 24/7) | 1 vCPU always-on ≈ 2.59M s − free tier → **about $55–65/month** (~$29 with `--cpu 0.5`). Not recommended |
 
-**推奨: ブリッジはリモートセッション時のみ接続**(WS を保持し続けると常時 1 インスタンス課金になるため)。オンデマンドなら概ね無料枠内。OpenAI 利用料は別建て(従来どおり、ブリッジ側で発生)。
+**Recommendation: connect the bridge only during remote sessions** (holding a WS continuously means always-on single-instance billing). On-demand mostly stays within the free tier. VLM provider usage is billed separately (as before, incurred on the bridge side).
 
-## C-6. ホームブリッジの実装・登録・常駐
+## C-6. Implementing, registering, and running the home bridge
 
-**実装**: `host_brain/` に `bridge_main.py` を新規追加(あるいは `main.py` を拡張)。既存 `car_link.py`/`brain.py`/`safety.py`/`dispatcher.py` と `main.py` の `brain_loop`/`arbiter_loop` を**そのまま再利用**し、上に WSS I/O 層(`relay_link.py`)を足すだけ:
-- リレーへ `wss://.../ws/bridge` を張る(Firebase REST でトークン取得 → hello JSON の `token`)。
-- 受信: `goal`→`st.goal`、`estop`→`st.estop`、`dryrun`→`cfg["brain"]["dry_run"]`、`heartbeat`/`deadman`→操作者ハートビート更新。
-- 送信: `video.frame` を JPEG 縮小して 2〜5 fps でバイナリ送出、`safety.want_stop()`/voltage/pan/tilt を `telemetry`、`intent.report` を `observation`。
-- `safety.py` に**操作者ハートビート監視**(`operator_link_lost`)を 1 条追加 → 監督リンク断で駆動不可。dry-run 既定 ON、ローカル反射(deadman/vision-stale/low-batt)は不変。
-- 依存追加(`requirements.txt`): `websockets`(または `aiohttp`)+ `requests`(Firebase REST)。
+**Implementation**: Add `bridge_main.py` to `host_brain/` (or extend `main.py`). **Reuse as-is** the existing `car_link.py`/`brain.py`/`safety.py`/`dispatcher.py` and `main.py`'s `brain_loop`/`arbiter_loop`, and just add a WSS I/O layer (`relay_link.py`) on top:
+- Open `wss://<relay-host>` to the relay (pathless; obtain the token via `firebase_auth.BridgeAuth` → the hello JSON `token`).
+- Receive: `goal`→`st.goal`, `estop`→`st.estop`, `dryrun`→the dry-run flag, `heartbeat`/`deadman`→update the operator heartbeat.
+- Send: the raw JPEG (`video.jpeg`) as a binary preview at `preview_hz` (default 4), and `safety.want_stop()`/voltage/pan/tilt/`observation` as a single `status` message at `status_hz` (default 2).
+- Add **operator-heartbeat monitoring** to `safety.py` (`operator link lost`) → drive is disallowed on a supervisory-link drop. Dry-run defaults ON; the local reflexes (deadman/vision-stale/low-batt) are unchanged.
+- Dependency additions (`requirements.txt`): `websockets` + `firebase-admin` (the token exchange in `firebase_auth.py` uses the standard-library `urllib`, so no extra HTTP client is required).
 
-**Mac 常駐(launchd)** — `~/Library/LaunchAgents/com.example.robotbrain-bridge.plist`:
+**Mac auto-start (launchd)** — `~/Library/LaunchAgents/com.example.robotbrain-bridge.plist`:
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -499,123 +517,116 @@ Cloud Run 無料枠(月): 180,000 vCPU 秒 / 360,000 GiB 秒 / 200 万リクエ�
     <string>~/esp32-ai-robot/host_brain/bridge_main.py</string>
   </array>
   <key>EnvironmentVariables</key><dict>
-    <key>OPENAI_API_KEY</key><string>sk-...</string>
-    <key>RELAY_WSS_URL</key><string>wss://robot-relay-xxxx.a.run.app/ws/bridge</string>
-    <key>FIREBASE_EMAIL</key><string>bridge@...</string>
-    <key>FIREBASE_PASSWORD</key><string>...</string>
-    <key>FIREBASE_WEB_API_KEY</key><string>AIza...</string>
+    <key>GEMINI_API_KEY</key><string>...</string>   <!-- only the VLM provider key lives in env -->
   </dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>   <!-- オンデマンド運用なら false + 手動 launchctl kickstart -->
+  <key>KeepAlive</key><true/>   <!-- for on-demand operation, false + a manual launchctl kickstart -->
   <key>StandardOutPath</key><string>/tmp/robotbrain-bridge.log</string>
   <key>StandardErrorPath</key><string>/tmp/robotbrain-bridge.err</string>
 </dict></plist>
 ```
-`launchctl load ~/Library/LaunchAgents/com.example.robotbrain-bridge.plist`。オンデマンド運用は `KeepAlive=false` にして、遠隔運転前に `launchctl kickstart -k gui/$(id -u)/com.example.robotbrain-bridge` で起動(コスト最小化)。plist は 600 権限で(パスワードを含むため)。
+`launchctl load ~/Library/LaunchAgents/com.example.robotbrain-bridge.plist`. For on-demand operation set `KeepAlive=false` and start before remote driving with `launchctl kickstart -k gui/$(id -u)/com.example.robotbrain-bridge` (cost minimization). Everything else (relay_url, owner_uid, api_key, and the path to the service-account JSON) lives in `config.toml`; keep `config.toml` and the service-account file at 600 permissions since they carry credentials.
 
-**Raspberry Pi 常駐(systemd)** — `/etc/systemd/system/robotbrain-bridge.service`:
+**Raspberry Pi auto-start (systemd)** — `/etc/systemd/system/robotbrain-bridge.service`:
 ```ini
 [Unit]
 Description=RobotBrain home bridge
 After=network-online.target
 [Service]
 WorkingDirectory=/home/pi/esp32-ai-robot/host_brain
-EnvironmentFile=/home/pi/esp32-ai-robot/host_brain/.env   # 600, OPENAI/FIREBASE/RELAY を格納
+EnvironmentFile=/home/pi/esp32-ai-robot/host_brain/.env   # 600; holds the VLM provider key (e.g. GEMINI_API_KEY)
 ExecStart=/home/pi/esp32-ai-robot/host_brain/.venv/bin/python3 bridge_main.py
 Restart=always
 RestartSec=3
 [Install]
 WantedBy=multi-user.target
 ```
-`sudo systemctl enable --now robotbrain-bridge`。Node 派の pm2 を使う場合は `pm2 start bridge_main.py --interpreter python3 --name robotbrain-bridge && pm2 save && pm2 startup`(ただし本ブリッジは Python なので launchd/systemd が素直)。
+`sudo systemctl enable --now robotbrain-bridge`. If you prefer pm2, `pm2 start bridge_main.py --interpreter python3 --name robotbrain-bridge && pm2 save && pm2 startup` (though since this bridge is Python, launchd/systemd is the natural fit).
 
 ---
 
-# 5. セキュリティ(§8 を継承・拡張)
+# 5. Security (inherits and extends §8)
 
-- **端から端まで WSS/TLS**(RNFR-1): 電話↔Cloud Run(TLS 終端は Google)/ Cloud Run↔ブリッジ(WSS)。生 `CMD_` TCP :4000/:7000 は**宅内 LAN から出ない**(ブリッジで終端)。Cloud Run マネージド証明書を用い、証明書検証を無効化しない。
-- **無認証で車を晒さない**(RNFR-2/3): リレーは Firebase ID トークン未検証の接続を close 4003 で拒否する。両ピア(phone・bridge)を Admin SDK `verify_id_token` で検証。MVP は**同一 `uid`(ペア)のみ**ブリッジし、本番は `devices/{deviceId}.ownerUid == phone.uid` または `allowedUids` へ拡張する。IAM は開放だがアプリ層で門番。任意で `ALLOWED_UIDS`。
-- **トークンは URL に載せない**(RNFR-3): MVP は hello JSON の `token`、将来は WS ハンドシェイクの `Authorization: Bearer` ヘッダ。どちらも URL クエリには載せない。iOS は Keychain 保管、ブリッジはサービスアカウント鍵 + Firebase Web API key を 600 権限の設定/Keychain へ置く。ログは token を redaction。
-- **車体プロトコルの非露出**(RNFR-4): リレーは `CMD_*` を解釈しない不透明フォワーダ。ブリッジは**意味メッセージのみ**受理し `dispatcher` のクランプを必ず通す(認証済みでも生ワイヤは送らせない)。車体への書き込みはブリッジのみ(単一書き込み者)。リレーはメディアを永続化しない(透過中継のみ)。
-- **秘密の局在**: OpenAI キーとブリッジ資格情報(パスワード/リフレッシュトークン)は自宅側のみ(600 権限、env/キーチェーン)。リレーは鍵ファイル不要(ADC 検証)。`GoogleService-Info.plist` は git 無視。サービスアカウント権限は最小権限(`YOUR-GCP-PROJECT` 内の必要な Firebase/Run 権限のみ)。
-- **ログ最小化**: production ログは token / uid / room / goal / observation / full JSON payload を出さない。必要な場合は DEBUG 時だけ、uid は短縮またはハッシュ化し、goal/observation/メッセージ本文は redaction する。`bad message` の全文ログは本番で無効化する。
-- **安全(遠隔運転・見えない車を動かす、RNFR-5 / §3 の反射をリモートへ拡張)**:
-  - **dry-run 既定 ON をリモートでも維持**、毎起動リセット。さらに**リモートはセッション毎に明示 `arm` するまで運動禁止**(既定 disarm)。切断で自動 disarm。
-	  - **リモート E-STOP**: phone の `{"t":"estop"}` が最優先。加えて **上り WSS 断/heartbeat 断で bridge が即 STOP**(リモートデッドマン)。人が見ていない分、ローカルより強い。
-  - **二重デッドマン**: phone からの heartbeat(~2〜10 Hz)が運動権限の前提。途絶 > `deadman_ms` で STOP(操作者ハートビート + ローカル intent 鮮度)。
-  - **視覚失効・低電圧**: ブリッジは LAN のフレームを直接見るため、`vision_stale_ms`・low-batt 反射はブリッジローカルでそのまま有効。
-  - **速度**: `remote_speed_cap`／`speedCap` を LAN より低く設定。
-	  - セッションのアイドルタイムアウトと、arm 時の明示ジェスチャを UI に用意。REMOTE+DRY バッジ常時可視化。監督リンク断=自律停止。
+- **WSS/TLS end to end** (RNFR-1): phone↔Cloud Run (TLS terminated by Google) / Cloud Run↔bridge (WSS). The raw `CMD_` TCP :4000/:7000 **never leaves the home LAN** (terminated at the bridge). Use Cloud Run managed certificates and do not disable certificate verification.
+- **Never expose the car unauthenticated** (RNFR-2/3): The relay rejects connections whose Firebase ID token is unverified with close 4003. Both peers (phone and bridge) are verified with the Admin SDK `verify_id_token`. The MVP bridges **only the same `uid` (pair)**; production extends to `devices/{deviceId}.ownerUid == phone.uid` or `allowedUids`. IAM is open, but the gate is at the app layer. There is **no allowlist**.
+- **Never put the token in the URL** (RNFR-3): The MVP uses the `token` in the hello JSON; future, an `Authorization: Bearer` header on the WS handshake. Neither goes in a URL query. iOS stores it in the Keychain; the bridge keeps the service-account JSON key + Firebase Web API key at 600-permission config/Keychain. Redact the token in logs.
+- **Non-exposure of the car protocol** (RNFR-4): The relay is an opaque forwarder that does not interpret `CMD_*`. The bridge accepts **semantic messages only** and always passes them through `dispatcher`'s clamps (even authenticated, no raw wire). Writing to the car is the bridge only (single writer). The relay does not persist media (transparent relay only).
+- **Locality of secrets**: The VLM provider key and the bridge credentials (the service-account JSON key) stay on the home side only (600 permission, env/Keychain/git-ignored file). The relay needs no key file (ADC verification). `GoogleService-Info.plist` is git-ignored. Service-account permissions are least-privilege (only the Firebase/Run permissions needed within `YOUR-GCP-PROJECT`).
+- **Minimize logging**: Production logs do not emit token / uid / room / goal / observation / full JSON payload. If needed, only under DEBUG, with the uid shortened or hashed and goal/observation/message bodies redacted. Full-text logging of `bad message` is disabled in production.
+- **Safety (remote driving, moving a car you cannot see; RNFR-5 / extending the §3 reflexes to remote)**:
+  - **Keep dry-run ON by default in Remote too**, reset every launch. Additionally, **Remote forbids motion until an explicit `arm` per session** (default disarm). Auto-disarm on disconnect.
+  - **Remote E-STOP**: The phone's `{"t":"estop"}` has top priority. In addition, **an uplink WSS drop / heartbeat lapse makes the bridge STOP immediately** (remote deadman). Because no one is watching, this is stronger than local.
+  - **Twin deadman**: A heartbeat from the phone (~2–10 Hz) is the precondition for motion authority. A lapse > `deadman_ms` → STOP (operator heartbeat + local intent freshness).
+  - **Vision-stale / low voltage**: Because the bridge sees the LAN frames directly, the `vision_stale_ms` and low-batt reflexes remain effective bridge-locally as-is.
+  - **Speed**: Set `speedcap`/the remote speed cap lower than LAN.
+  - Provide a session idle timeout and an explicit arm gesture at arm time in the UI. Keep the REMOTE+DRY badge always visible. Supervisory-link drop = autonomous stop.
 
 ### Remote failure modes
 
-| 事象 | 実装上の理由名 | 車体動作 | UI / セッション |
+| Event | Implementation reason name | Car behavior | UI / session |
 |---|---|---|---|
-| Phone⇔Relay 断、または phone 離脱 | `operator link lost` / `peer up=false` | Bridge が STOP、dry-run ON、E-STOP ラッチ | Remote link down / operator lost を表示。再接続時も再 arm が必要 |
-| Relay⇔Bridge 断 | `relay link down` | Bridge が STOP | RelayClient は 2 秒後再接続。bridge も再接続 |
-| Bridge⇔Car command 断 | `command-link down` | Bridge 側は駆動不可。車体側 deadman/stop-and-hold が停止 | UI は linkDown 表示 |
-| Camera/preview stale | `vision stale (blind)` | AI/Remote 駆動停止 | UI は visionStale 表示 |
-| Brain/intent stale | `deadman (no fresh intent)` | 駆動停止 | goal が空なら hold 表示 |
-| Low battery | `low battery (<V>V)` | 駆動停止 | voltage badge / low battery 表示 |
+| Phone⇔Relay drop, or phone leaves | `operator link lost` / `peer up=false` | Bridge STOPs, dry-run ON, E-STOP latched | Show "Remote link down / operator lost." Re-arm is required even on reconnect |
+| Relay⇔Bridge drop | `relay link down` | Bridge STOPs | RelayClient reconnects after 2 s; the bridge reconnects too |
+| Bridge⇔Car command drop | `command-link down` | The bridge cannot drive; the car-side deadman / stop-and-hold stops it | UI shows linkDown |
+| Camera/preview stale | `vision stale (blind)` | AI/Remote drive stops | UI shows visionStale |
+| Brain/intent stale | `deadman (no fresh intent)` | Drive stops | If goal is empty, show hold |
+| Low battery | `low battery (<V>V)` | Drive stops | voltage badge / low battery shown |
 
 ---
 
-# 6. 段階実装計画(MVP → 本番)
+# 6. Phased implementation plan (MVP → production)
 
-## Phase 0 — 前提整備
+## Phase 0 — Prerequisites
 
-- Firebase コンソールで `YOUR-GCP-PROJECT` を「Firebase に追加」、Authentication 有効化(Email/Password + Apple)。
-- iOS アプリ(bundle `com.example.robotbrainai`)登録 → `GoogleService-Info.plist` 取得 → `ios_app/` に配置し **`.gitignore` に追加**。
-- `gcloud services enable`(run / cloudbuild / artifactregistry / identitytoolkit)。
+- In the Firebase console, "Add Firebase to" `YOUR-GCP-PROJECT`, enable Authentication (Apple for the phone; the bridge uses a service-account custom token, so no Email/Password account is needed).
+- Register the iOS app (bundle `com.example.robotbrainai`) → obtain `GoogleService-Info.plist` → place it in `ios_app/` and **add it to `.gitignore`**.
+- `gcloud services enable` (run / cloudbuild / artifactregistry / identitytoolkit).
 
-## Phase 1 — MVP(最小疎通・同一 uid ペアリング)
+## Phase 1 — MVP (minimal end-to-end, same-uid pairing)
 
-> **実装状況(2026-07-28)** — リレー、家ブリッジ、アプリ側 Remote thin client は実装済み。Cloud Run 本番 WSS と Firebase 認証を前提にした E2E は、実機環境での再確認対象。
-> 実装上の相違点(仕様と等価): リレーは FastAPI ではなく**素の `websockets`**(§A で許容)、ブリッジのエントリは
-> `bridge_main.py` ではなく **`bridge_main.py`**、`VideoLink` の生JPEGフィールドは `latest_jpeg` ではなく **`jpeg`**、
-> `safety.py` の停止理由は **`relay link down` / `operator link lost`**、電話↔ブリッジのキーは正準 `t` に加え
-> `type` も受理。認証は WS upgrade ヘッダではなく、最初の hello JSON の `token` を relay が検証する。
+> **Implementation status** — The relay, the home bridge, and the app-side Remote thin client are implemented. End-to-end verification on the production Cloud Run WSS with Firebase auth is to be re-confirmed in a real-device environment.
+> Implementation notes (equivalent to the spec): the relay is **plain `websockets`** rather than FastAPI (allowed by §A); the bridge entry point is **`bridge_main.py`** (a thin entry alongside `main.py`, superseding the earlier `/ws/{role}` FastAPI sketch); `VideoLink`'s raw-JPEG field is **`jpeg`** rather than the spec's `latest_jpeg`; `safety.py`'s stop reasons are **`relay link down` / `operator link lost`**; the phone↔bridge keys accept the canonical `t` plus the `type` alias. Auth is the relay verifying the `token` in the first hello JSON, not a WS-upgrade header.
 
-- **リレー(新規・Cloud Run)**: ~~FastAPI +~~ **素の `websockets`** + `firebase-admin`、role=phone|bridge(hello で宣言)、**同一 uid ペアリング**、text/binary 素通し。`--region asia-northeast1 --timeout 3600 --min-instances 0 --max-instances 1 --cpu 1 --memory 256Mi --allow-unauthenticated`。ソースデプロイ(§4-C.2)。**[実装済 `relay/server.py`]**
-- **ブリッジ(新規)**: `host_brain/` に **`bridge_main.py`** + `relay_link.py`。既存 `brain.py`/`safety.py`/`dispatcher.py`/`arbiter_loop`(相当)再利用。`VideoLink.jpeg` 追加(§B.4)、生 JPEG フォワード、`safety.py` に **operator/relay 生存反射**(`operator link lost`/`relay link down`)追加、**起動時 dry-run 強制 ON**(config 無視)＋切断で自動 disarm、全ループ `supervise()` 監視。**[実装済]** 残り: 実運用での常駐化とログ redaction 確認。
-- **アプリ**: `LinkMode` トグル、`RelayClient`(`URLSessionWebSocketTask`)、薄いクライアント動作(§3-B-4)、REMOTE/DRY バッジ、モード切替のグレースフル停止、~2Hz heartbeat、リモートarmの確認ゲート、E-STOPローカルラッチ、`AuthStore`。**[実装済]** 校正はLAN限定。
-- **メッセージ**: 電話→ブリッジ `goal`/`estop{on}`/`go`/`arm`/`disarm`/`dryrun{on}`/`speedcap{v}`/`heartbeat`/`look{pan,tilt}`/`face{mode}`/`leds{mode}`/`drive{throttle,steer,duration_ms}`(キーは `t` 正準・`type` 別名、いずれも受理)。ブリッジ→電話 `status{cmd,cam,goal,estop,dry_run,voltage,distance,safety,task_state,observation,pan,tilt}` + binary JPEG プレビュー。
-- **到達判定(暫定)**: ユーザーがトグルで LAN/Remote を手動選択。
+- **Relay (new, Cloud Run)**: **plain `websockets`** + `firebase-admin`, role=phone|bridge (declared in the hello), **same-uid pairing**, text/binary pass-through. `--region asia-northeast1 --timeout 3600 --min-instances 0 --max-instances 1 --cpu 1 --memory 256Mi --allow-unauthenticated`. Source deploy (§4-C.2). **[implemented: `relay/server.py`]**
+- **Bridge (new)**: `bridge_main.py` + `relay_link.py` in `host_brain/`. Reuses the existing `brain.py`/`safety.py`/`dispatcher.py`/`arbiter_loop` (equivalent). Adds `VideoLink.jpeg` (§B.4), raw-JPEG forwarding, an **operator/relay liveness reflex** in `safety.py` (`operator link lost`/`relay link down`), and **forces dry-run ON at startup** (ignoring config) + auto-disarm on disconnect, with all loops monitored by `supervise()`. **[implemented]** Remaining: real-world daemonization and log-redaction confirmation.
+- **App**: `LinkMode` toggle, `RelayClient` (`URLSessionWebSocketTask`), thin-client behavior (§3-B-4), REMOTE/DRY badge, graceful stop on mode switch, ~2 Hz heartbeat, a remote-arm confirmation gate, a local E-STOP latch, and `AuthStore`. **[implemented]** Calibration is LAN-only.
+- **Messages**: phone→bridge `goal`/`estop{on}`/`go`/`arm`/`disarm`/`dryrun{on}`/`speedcap{v}`/`heartbeat`/`look{pan,tilt}`/`face{mode}`/`leds{mode}`/`drive{throttle,steer,duration_ms}` (keys: `t` canonical, `type` alias, both accepted). bridge→phone `status{cmd,cam,goal,estop,dry_run,voltage,distance,safety,task_state,observation,pan,tilt}` + binary JPEG preview.
+- **Reachability (interim)**: The user manually selects LAN/Remote via the toggle.
 
-## Phase 2 — 本番強化
+## Phase 2 — Production hardening
 
-- **ペアリング**: Firestore `devices/{deviceId}`(ownerUid/roomName/allowedUids)+ Callable Function `provisionDevice`(カスタムトークン発行、claims `{role, deviceId, ownerUid}`)。ブリッジ認証を Email/Password → **カスタムトークン由来 ID トークン**へ移行。relay ルームを **deviceId 単位**に。アプリの claim(コード/QR)導線と unpair(RFR-6)。
-- **フレーミング完全版**: `t` タグ拡張(`hello`/`intent`/`arm`/`disarm`/`status`)、binary 5 バイトヘッダ(channel + seq)で最新フレーム失効判定をエンドツーエンド化。
-- **運動権限の operator 排他ロック**(複数閲覧端末の許容、二重操縦防止)。
-- **グレースフルフォールバック**: LAN 到達性自動判定 + 自動モード切替(RFR-12)、3 区間(フォン⇔リレー／リレー⇔ブリッジ／ブリッジ⇔車体)の状態可視化と自動再接続(RFR-13)。
-- **バックプレッシャ厳密化**: latest-wins 送信キュー長 1、高水位(>256 KB)スキップ、~55 分先回りグレースフル再接続、指数バックオフ + ジッタ、WS ping/pong ~20〜30s、upgrade 時 `Authorization` ヘッダ認証。
-- **将来(対象外・OS-9)**: `max-instances > 1` が必要になったらプロセス内突き合わせを外部化(Memorystore(Redis) pub/sub / Pub/Sub + セッションアフィニティ)。複数拠点・複数ユーザ共有、マルチリージョン HA、高解像度/高 fps 映像。
+- **Pairing**: Firestore `devices/{deviceId}` (ownerUid/roomName/allowedUids) + a Callable Function `provisionDevice` (issues a custom token, claims `{role, deviceId, ownerUid}`). Migrate bridge auth from the same-uid custom token to a **provisioned custom-token-derived ID token** with a deviceId claim. Move the relay room to **per-deviceId**. Add the app's claim (code/QR) flow and unpair (RFR-6).
+- **Full framing**: extend the `t` tags (`hello`/`intent`/`arm`/`disarm`/`status`), and add the binary 5-byte header (channel + seq) to make the latest-frame staleness check end-to-end.
+- **Operator exclusive lock on motion authority** (allowing multiple viewer devices; preventing dual piloting).
+- **Graceful fallback**: automatic LAN-reachability detection + automatic mode switching (RFR-12); visualization and auto-reconnect of the three segments (phone⇔relay / relay⇔bridge / bridge⇔car) (RFR-13).
+- **Stricter backpressure**: latest-wins send-queue length 1, high-water (>256 KB) skip, ~55-min pre-emptive graceful reconnect, exponential backoff + jitter, WS ping/pong ~20–30 s, and `Authorization`-header auth on upgrade.
+- **Future (out of scope, OS-9)**: if `max-instances > 1` becomes necessary, externalize the in-process matching (Memorystore (Redis) pub/sub / Pub/Sub + session affinity). Multi-site / multi-user sharing, multi-region HA, and high-resolution / high-fps video.
 
-## 実装差分サマリ(参照)
+## Implementation-diff summary (reference)
 
-1. **relay**(Cloud Run, Python `websockets` + `firebase-admin`): hello.token 認証・同一 uid ペアリング・text/binary 多重化・ping/pong。
-2. **`relay_link.py`**(新規・bridge): アウトバウンド WSS、デバイス認証、意味メッセージ ⇄ arbiter/brain、映像フォワード。`main.py` の `gather` に 2 タスク追加(または `bridge_main.py` エントリ)。
-3. **`car_link.py` 微修正**: `VideoLink` に生 JPEG(`latest_jpeg` + seq/ts)保持を追加(再エンコード回避)。
-4. **`safety.py` 拡張**: `note_operator()` / `operator link lost` と停止理由 `relay link down` を追加、`want_stop()` に組み込み。
-5. **`config.toml`**: `[relay]` セクション追加(url / device_id / cred_env / remote_speed_cap)。認証情報は env/キーチェーン。
-6. **Firestore**(本番): `devices/{deviceId}` + Callable `provisionDevice`。
-7. **アプリ**: LAN/Remote トグル、`CarTransport`/`RelayTransport`、`AuthStore` + Keychain、薄いクライアント動作。`dispatcher`/`Intent` スキーマは LAN と共通に保つ。
+1. **relay** (Cloud Run, Python `websockets` + `firebase-admin`): hello.token auth, same-uid pairing, text/binary multiplexing, ping/pong.
+2. **`relay_link.py`** (new, bridge): outbound WSS, device auth, semantic messages ⇄ arbiter/brain, video forwarding. Adds 2 tasks to `main.py`'s `gather` (or the `bridge_main.py` entry).
+3. **`car_link.py` minor tweak**: keep the raw JPEG (`jpeg` + ts) in `VideoLink` (avoid re-encode).
+4. **`safety.py` extension**: add `note_operator()` / `operator link lost` and the stop reason `relay link down`, wired into `want_stop()`.
+5. **`config.toml`**: add the `[remote]` section (relay_url / room / token / preview_hz / status_hz / auth / owner_uid / service_account / api_key; device_id / remote_speed_cap are Phase 2). Credentials go in env/Keychain / a git-ignored file.
+6. **Firestore** (production): `devices/{deviceId}` + a Callable `provisionDevice`.
+7. **App**: LAN/Remote toggle, `CarTransport`/`RelayTransport`, `AuthStore` + Keychain, thin-client behavior. Keep the `dispatcher`/`Intent` schema common with LAN.
 
 ---
 
-# 7. リスク
+# 7. Risks
 
-| # | リスク | 影響 | 緩和策 |
+| # | Risk | Impact | Mitigation |
 |---|---|---|---|
-| R1 | **脳の二重保守**(LAN=Swift `Brain`、Remote=Python `brain.py`) | プロンプト／挙動の乖離 | 同一 `SYSTEM_PROMPT`・`Intent` JSON スキーマを共有。将来はブリッジ脳へ一本化(v1.2 対象外) |
-| R2 | **常時接続の課金**(24/7 WSS ≈ $55〜65/月) | コスト超過 | オンデマンド接続を推奨(launchd `KeepAlive=false`/kickstart)。`min-instances=0`+`max-instances=1` |
-| R3 | **コールドスタート**(~1〜3s) | 初回接続の体感遅延 | 安全上は無問題(STOP はブリッジ完結)。体感重視なら `min-instances=1`(課金増) |
-| R4 | **単一インスタンス制約**(`max-instances=1`) | 単一ペアのみ・スケール不可 | v1.2 は単一家庭前提。複数拠点は外部突き合わせ(Redis/Pub/Sub)＝OS-9 |
-| R5 | **60 分 WS 上限**(`--timeout=3600`) | 接続強制切断 | ~55 分で先回りグレースフル再接続。脳はブリッジなので制御は無停止、映像瞬断のみ |
-| R6 | **HOL ブロッキング**(映像が制御を詰まらせる) | STOP/コマンド遅延 | 方向分離(下り映像/上りコマンド)+ latest-wins。厳密には制御/メディア 2 本 WS(課金増) |
-| R7 | **トークン失効**(ID トークン 1h) | 認証断・再接続失敗 | 期限前に自動更新(app: getIDToken、bridge: refresh/REST)。再接続前に取り直し |
-| R8 | **見えない走行の暴走** | 物損・安全 | 多段安全網: dry-run 既定 ON、毎セッション明示 arm、二重デッドマン、vision-stale/low-batt ブリッジ反射、低速 `speedCap`、常時可視 REMOTE+DRY バッジ、リンク断=自律停止 |
-| R9 | **秘密情報漏洩** | 資格情報流出 | OpenAI キー/ブリッジ資格情報は宅内のみ(600, env/keychain)、`GoogleService-Info.plist` git 無視、トークンは URL 非搭載・ログ redaction、リレーは鍵ファイル不要(ADC) |
-| R10 | **帯域超過**(モバイル/宅内アップリンク) | 通信量・遅延 | プレビューを 2〜5 fps・低画質へ間引き、RNFR-6(≈384 kbps 上限)内に収める。認知フレームはリレーを通さない(案B) |
-| R11 | **単一リージョン障害**(`asia-northeast1`) | Remote 不能 | LAN モードは無影響で利用継続、車体はフェイルセーフ停止(RNFR-9)。可用性低下は停止側に倒す |
-| R12 | **Apple サインインの制約**(ヘッドレス不可) | ブリッジ認証不能 | ブリッジは Email/Password(MVP)またはカスタムトークン(本番)。Apple は電話専用 |
+| R1 | **Double-maintaining the brain** (LAN = Swift `Brain`, Remote = Python `brain.py`) | Prompt/behavior drift | Share the same `SYSTEM_PROMPT` and `Intent` JSON schema. Unify onto the bridge brain in the future (out of scope for v1.2) |
+| R2 | **Always-on billing** (24/7 WSS ≈ $55–65/month) | Cost overrun | Recommend on-demand connection (launchd `KeepAlive=false`/kickstart). `min-instances=0` + `max-instances=1` |
+| R3 | **Cold start** (~1–3 s) | First-connection perceived delay | No safety issue (STOP is handled on the bridge). For a snappier feel, `min-instances=1` (higher billing) |
+| R4 | **Single-instance constraint** (`max-instances=1`) | Only a single pair; no scaling | v1.2 assumes a single household. Multi-site needs external matching (Redis/Pub/Sub) = OS-9 |
+| R5 | **60-min WS limit** (`--timeout=3600`) | Forced disconnect | Pre-emptive graceful reconnect at ~55 min. Since the brain is on the bridge, control is uninterrupted; only a momentary video blip |
+| R6 | **HOL blocking** (video stalls control) | STOP/command delay | Direction separation (downlink video / uplink commands) + latest-wins. Strictly, two WS for control/media (higher billing) |
+| R7 | **Token expiry** (ID token 1h) | Auth drop / reconnect failure | Auto-refresh before expiry (app: getIDToken, bridge: refresh via REST). Re-fetch before reconnecting |
+| R8 | **Runaway while driving blind** | Property damage / safety | Multi-tier safety net: dry-run ON by default, explicit arm every session, twin deadman, vision-stale/low-batt bridge reflexes, low `speedCap`, an always-visible REMOTE+DRY badge, link drop = autonomous stop |
+| R9 | **Secret leakage** | Credential exposure | The VLM provider key / bridge credentials stay home-side only (600, env/keychain, git-ignored file), `GoogleService-Info.plist` git-ignored, tokens not in URLs and redacted in logs, the relay needs no key file (ADC) |
+| R10 | **Bandwidth overrun** (mobile / home uplink) | Data usage / delay | Thin the preview to 2–5 fps / low quality, staying within RNFR-6 (≈384 kbps cap). Cognition frames never pass through the relay (option B) |
+| R11 | **Single-region outage** (`asia-northeast1`) | Remote unavailable | LAN mode continues unaffected; the car fail-safe stops (RNFR-9). Reduced availability falls to the stop side |
+| R12 | **Sign in with Apple constraint** (no headless) | Bridge cannot authenticate | The bridge uses a service-account custom token; Apple is phone-only |

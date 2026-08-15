@@ -1,70 +1,70 @@
-> **Note.** The ESP32 firmware is a not-included Freenove derivative; any `firmware/…` path in this doc is *descriptive* (see the [README](README.md) license note).
+> **Note.** The ESP32 firmware is a not-included Freenove derivative; any `firmware/…` path in this document is *descriptive* (see the [README](README.md) license note).
 
-# RobotBrain 設計書
+# RobotBrain Design Document
 
-- 文書バージョン: 1.1（現行実装・品質受入条件反映）
-- 対象アプリ: RobotBrain（iOS ネイティブ / SwiftUI）
-- バンドル ID: `com.example.robotbrainai`
-- ビルド環境: Xcode 26 / iOS 26 SDK（デプロイメントターゲット iOS 17.0、XcodeGen 管理）
-- 作成日: 2026-07-24
-- 位置づけ: 本書は RobotBrain の**設計仕様**である。既存 `ios_app/` / `host_brain/` / `relay/` / `firmware/AI_Car_Firmware` を正とし、現行実装の挙動と残る honest gap を明記する。コードトークン（`CMD_MOTOR` 等）・クラス名は原文表記のまま扱う。
-- 構成: 第 I 部にアーキテクチャ・技術設計、第 II 部に UX・画面・多言語設計を置く。
-
----
-
-# 第 I 部　アーキテクチャ・技術設計
-
-RobotBrain は、自然言語のゴール（テキストまたは音声）を与えると OpenAI のビジョンモデルが計画し、Freenove 4WD ESP32 車体（FNK0053, ESP32-WROVER）が AI ローバーとして動作する iOS ネイティブアプリである。「見る → 判断する → 少し動かす → また見る」という熟慮的ループを、レイテンシを許容する前提で回す。
+- Document version: 1.1 (reflects the current implementation and the quality-acceptance criteria)
+- Target app: RobotBrain (native iOS / SwiftUI)
+- Bundle ID: `com.example.robotbrainai`
+- Build environment: Xcode 26 / iOS 26 SDK (deployment target iOS 17.0, managed with XcodeGen)
+- Created: 2026-07-24
+- Scope: This is the **design specification** for RobotBrain. It treats the existing `ios_app/` / `host_brain/` / `relay/` and the (not-included, Freenove-derivative) `AI_Car_Firmware` as ground truth, and states both the behavior of the current implementation and the honest gaps that remain. Code tokens (`CMD_MOTOR`, etc.) and class names are kept verbatim.
+- Structure: Part I covers the architecture and technical design; Part II covers the UX, screens, and localization design.
 
 ---
 
-## 1. 全体アーキテクチャ — 3層(身体・反射／頭脳／皮質)
+# Part I — Architecture and Technical Design
 
-責務を「速さ」で三層に分離する。判断は遅くてよい(レイテンシ許容)、しかし**停止は速くなければならない**——この非対称性が層分割の根拠である。
+RobotBrain is a native iOS app: give it a natural-language goal (text or voice) and an OpenAI vision model plans while a Freenove 4WD ESP32 chassis (FNK0053, ESP32-WROVER) acts as an AI rover. It runs a deliberative "look → decide → move a little → look again" loop, on the premise that latency is acceptable.
 
-### 1.1 テキスト／ASCII アーキテクチャ図
+---
+
+## 1. Overall Architecture — Three Layers (Body/Reflex, Brain, Cortex)
+
+Responsibilities are split into three layers by "speed." Decisions may be slow (latency is tolerated), but **stopping must be fast** — this asymmetry is the rationale for the layer split.
+
+### 1.1 Text / ASCII architecture diagram
 
 ```
         ┌───────────────────────────────────────────────────────────────┐
-        │  皮質 CORTEX — OpenAI Vision(クラウド)   ~0.7Hz               │
-        │  1フレーム(JPEG b64) + ゴール  →  Intent(JSON)                │
-        │  生モータ値は決して出さない(意味動詞のみ)                     │
+        │  CORTEX — OpenAI Vision (cloud)               ~0.7 Hz          │
+        │  1 frame (JPEG b64) + goal  →  Intent (JSON)                   │
+        │  never emits raw motor values (semantic verbs only)           │
         └──────────▲────────────────────────────────────┬───────────────┘
-                   │ Intent                              │ frame(JPEG b64)
+                   │ Intent                              │ frame (JPEG b64)
         ┌──────────┴────────────────────────────────────▼───────────────┐
-        │  頭脳 BRAIN — iPhone アプリ RobotBrain      ~10Hz(心拍)        │
+        │  BRAIN — iPhone app RobotBrain              ~10 Hz (heartbeat) │
         │  ┌──────────────────────────────────────────────────────────┐ │
-        │  │ RobotController — 唯一の車体書き込み者 / アービタ /        │ │
-        │  │                   安全反射 / 言語解決 / 設定永続化         │ │
+        │  │ RobotController — the sole writer to the car / arbiter /  │ │
+        │  │                   safety reflexes / language / settings   │ │
         │  └──┬──────────────┬──────────────┬────────────────┬─────────┘ │
-        │   Brain        Dispatcher       Speech           CarLink        │
-        │  frame→Intent  Intent→CMD_文字列 STT/TTS       2本の永続TCP    │
-        │               (クランプの砦)                                   │
+        │   Brain        Dispatcher       Speech           CarLink       │
+        │  frame→Intent  Intent→CMD_ str  STT/TTS       two persistent   │
+        │               (clamp fortress)                    TCP links    │
         └───────────────────────────────────┬────────────────────────────┘
                     CMD_* :4000  │           │  JPEG :7000
         ┌────────────────────────▼───────────▼───────────────────────────┐
-        │  反射 REFLEX — ESP32-WROVER 車体            50-100Hz            │
-        │  モータ/サーボ PWM · JPEG 取得 · 車載デッドマン停止 ·           │
-        │  切断時 stop-and-hold · 低電圧カットオフ                        │
+        │  REFLEX — ESP32-WROVER chassis                50-100 Hz        │
+        │  motor/servo PWM · JPEG capture · on-board deadman stop ·      │
+        │  stop-and-hold on disconnect · low-voltage cutoff             │
         └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 詳細フロー(mermaid)
+### 1.2 Detailed flow (mermaid)
 
 ```mermaid
 flowchart TB
-    subgraph CORTEX["皮質 CORTEX — OpenAI Vision (クラウド)"]
-        VLM["gpt-4o-mini 等 ~0.7Hz : 1フレーム+ゴール → Intent(JSON)"]
+    subgraph CORTEX["CORTEX — OpenAI Vision (cloud)"]
+        VLM["gpt-4o-mini etc. ~0.7Hz : 1 frame + goal → Intent(JSON)"]
     end
-    subgraph BRAIN["頭脳 BRAIN — iPhone アプリ RobotBrain (~10Hz)"]
-        RC["RobotController<br/>唯一の車体書き込み者 / アービタ / 安全反射 / 言語解決"]
-        BR["Brain フレーム→Intent"]
-        DP["Dispatcher Intent→CMD_(クランプ)"]
+    subgraph BRAIN["BRAIN — iPhone app RobotBrain (~10Hz)"]
+        RC["RobotController<br/>sole writer to the car / arbiter / safety reflexes / language"]
+        BR["Brain frame→Intent"]
+        DP["Dispatcher Intent→CMD_(clamp)"]
         SP["Speech STT/TTS"]
-        CL["CarLink 2本の永続TCP"]
+        CL["CarLink two persistent TCP"]
     end
-    subgraph REFLEX["反射 REFLEX — ESP32-WROVER 車体 (50-100Hz)"]
-        FW["モータ/サーボPWM · JPEG取得 · 車載デッドマン · 切断時stop-and-hold · 低電圧カットオフ"]
+    subgraph REFLEX["REFLEX — ESP32-WROVER chassis (50-100Hz)"]
+        FW["motor/servo PWM · JPEG capture · on-board deadman · stop-and-hold on disconnect · low-voltage cutoff"]
     end
     VLM -- "frame(JPEG b64)" --> BR
     BR -- "Intent" --> RC
@@ -76,425 +76,431 @@ flowchart TB
     SP <--> RC
 ```
 
-### 1.3 各層の役割
+### 1.3 Role of each layer
 
-- **反射層(ESP32-WROVER)**: 身体と反射のみ。オンデバイス ML 推論は不可(GPU/NPU なし、実効 RAM 数 MB)。フレームは「処理」せず「転送」するだけ。パッチ済みファーム `AI_Car_Firmware` は (1) **車載デッドマン**(一定時間 `CMD_MOTOR` が来なければ `Motor_Move(0,0,0,0)`)、(2) **切断時 stop-and-hold**(`ESP.restart()` を廃し、停止して再接続待ち)を持つ。モータのデッドゾーンは `|speed|<1600 ⇒ 0`。
-- **頭脳層(iPhone アプリ)**: ブローカ兼アービタ。**車体への唯一の書き込み者**。ソケットを開き続け、クラウドの遅延・失敗を吸収し、意味動詞を `CMD_` 文字列へ降ろし、ホスト側安全反射を回す。判断のカデンスと心拍のカデンスを分離する。実行時に Mac を必要としない。
-- **皮質層(OpenAI)**: 1 フレーム + ゴールを見て構造化 `Intent` を返すのみ。生のモータ値は決して出さない(不正・危険な指令を構造的に出せない)。
+- **Reflex layer (ESP32-WROVER)**: body and reflexes only. On-device ML inference is impossible (no GPU/NPU, a few MB of usable RAM). It does not "process" frames — it merely "forwards" them. The patched firmware (a not-included Freenove derivative), `AI_Car_Firmware`, adds (1) an **on-board deadman** (if no `CMD_MOTOR` arrives within a fixed window, it runs `Motor_Move(0,0,0,0)`), and (2) **stop-and-hold on disconnect** (instead of `ESP.restart()`, it stops and waits for reconnection). The motor dead-zone is `|speed| < 1600 ⇒ 0`.
+- **Brain layer (iPhone app)**: broker and arbiter. The **sole writer to the car**. It keeps the sockets open, absorbs cloud latency and failures, lowers semantic verbs into `CMD_` strings, and runs the host-side safety reflexes. It decouples the decision cadence from the heartbeat cadence. No Mac is required at run time.
+- **Cortex layer (OpenAI)**: it only looks at 1 frame + the goal and returns a structured `Intent`. It never emits raw motor values (it is structurally incapable of issuing an invalid or dangerous motor command).
 
-### 1.4 非交渉の設計前提(ファーム実測に基づく)
+### 1.4 Non-negotiable design assumptions (based on measured firmware behavior)
 
-- 頭脳がソケットを保持し続ける。AI 呼び出しがソケットを握ってはならない。
-- モータはラッチする(自己満了パルスで必ず期限切れさせる)。
-- クラウド頭脳のため車体は **STA モード**(家庭ルータ参加、DHCP・IP はドリフトする)。SoftAP(`Sunshine`)はクラウド到達不可のため運用対象外。
+- The brain holds the sockets open. An AI call must never own a socket.
+- Motors latch (they must always be expired by a self-terminating pulse).
+- Because the brain is in the cloud, the chassis runs in **STA mode** (it joins the home router; its DHCP/IP will drift). SoftAP mode (the on-board setup AP) cannot reach the cloud and is therefore out of scope for operation.
 
 ---
 
-## 2. モジュール設計(モジュールマップ)
+## 2. Module Design (module map)
 
-| モジュール | ファイル | 責務 |
+| Module | File | Responsibility |
 |---|---|---|
-| **CarLink** | `CarLink.swift` | :4000 コマンド + :7000 カメラの永続 TCP(`Network.framework`) |
-| **Brain** | `Brain.swift` | OpenAI Vision 呼び出し → `Intent` へパース |
-| **Speech** | `Speech.swift` | 端末側 STT/TTS(車体にはマイク/スピーカ無し) |
-| **RobotController** | `RobotController.swift` | アービタ制御ループ + 安全 + 言語解決 + 設定永続化 |
-| **Dispatcher** | `Dispatcher.swift` | 意味動作 → 正確な `CMD_` ワイヤ文字列(クランプ) |
-| **ContentView / MainView / ConfigView** | `ContentView.swift` | Liquid Glass UI + 設定 |
-| **RobotBrainApp** | `RobotBrainApp.swift` | `@main` エントリ |
+| **CarLink** | `CarLink.swift` | Persistent TCP for the :4000 command channel + the :7000 camera channel (`Network.framework`) |
+| **Brain** | `Brain.swift` | Calls the OpenAI vision model → parses into `Intent` |
+| **Speech** | `Speech.swift` | On-device STT/TTS (the chassis has no mic/speaker) |
+| **RobotController** | `RobotController.swift` | Arbiter control loop + safety + language resolution + settings persistence |
+| **Dispatcher** | `Dispatcher.swift` | Semantic actions → exact `CMD_` wire strings (clamps) |
+| **ContentView / MainView / ConfigView** | `ContentView.swift` | Liquid Glass UI + settings |
+| **RobotBrainApp** | `RobotBrainApp.swift` | `@main` entry point |
 
-### 2.1 CarLink — TCP :4000 + :7000(Network.framework)
+### 2.1 CarLink — TCP :4000 + :7000 (Network.framework)
 
-`@MainActor final class ... ObservableObject`。`NWConnection`(TCP)を 2 本保持:
+`@MainActor final class ... ObservableObject`. It holds two `NWConnection` (TCP) links:
 
-- **コマンド(:4000)**: `send(_ line:)` が `line + "\n"` を UTF-8 送信。`stateUpdateHandler` で `.ready`→`cmdConnected=true`、`.failed`→1 秒後に `retryCommand()`。`.cancelled` は再接続しない(意図的停止)。
-- **カメラ(:7000)**: `.ready` で `readFrame` 開始。`readExact(n:)` が `minimumIncompleteLength` で確実に n バイト受信。フレーム形式は **4 バイト LE 長 + JPEG**。長さは `0 < len < 4_000_000` でサニティチェック、`UIImage(data:)` 復号後 `image` / `lastFrameAt` を更新し次フレームへ再帰。
-- 公開状態: `image`, `lastFrameAt`, `cmdConnected`, `camConnected`, `voltage`, `distance`(すべて `@Published`)。コマンドチャネルは `CMD_POWER#<voltage>` と `CMD_SONIC#<cm>` を解析する。専用 `DispatchQueue("carlink")` 上で動作、UI 更新は `Task { @MainActor }` で戻す。
+- **Command (:4000)**: `send(_ line:)` transmits `line + "\n"` as UTF-8. In `stateUpdateHandler`, `.ready` → `cmdConnected=true`, and `.failed` → `retryCommand()` after 1 second. `.cancelled` does not reconnect (an intentional stop).
+- **Camera (:7000)**: on `.ready` it starts `readFrame`. `readExact(n:)` uses `minimumIncompleteLength` to reliably receive exactly n bytes. The frame format is a **4-byte little-endian length + JPEG**. The length is sanity-checked with `0 < len < 4_000_000`; after decoding with `UIImage(data:)` it updates `image` / `lastFrameAt` and recurses to the next frame.
+- Published state: `image`, `lastFrameAt`, `cmdConnected`, `camConnected`, `voltage`, `distance` (all `@Published`). The command channel also parses `CMD_POWER#<voltage>` and `CMD_SONIC#<cm>` reply lines. Everything runs on a dedicated `DispatchQueue("carlink")`; UI updates are hopped back with `Task { @MainActor }`.
 
 ### 2.2 Brain — OpenAI Vision → Intent
 
-`Intent` 構造体: `throttle`, `steer`(±1)、`durationMs`、`pan?`, `tilt?`、`face?`、`observation`、`taskState`(`searching|approaching|done|blocked`)。`.hold` は全ゼロ既定。
-`decide(image:goal:memory:apiKey:model:lang:)` は `chat/completions` に `image_url`(base64 JPEG, `detail:"low"` = 低トークン)+ システムプロンプト + ゴール + 直近メモリ 4 件を送る。言語行(`langLine`)で observation の出力言語を切替。`parse(_:)` は最初の `{` と最後の `}` を切り出して JSON 復元、失敗時は `.hold`(安全側)。**モデルは意味動詞のみ、生モータ値は出力しない。**
+`Intent` struct: `throttle`, `steer` (±1), `durationMs`, `pan?`, `tilt?`, `observation`, `taskState` (`searching | approaching | done | blocked`), plus the fused-exploration perception fields `forwardOpen?` (0..1 openness of the direction the head currently faces) and `hazard` (`none | soft | ledge | wall`). A `face?` field is retained on the struct for wire compatibility, but the live loop does not act on it (the model's JSON schema no longer requests it). `.hold` is the all-stop default.
+`decide(image:goal:memory:apiKey:model:lang:distanceCm:)` posts to `chat/completions` with an `image_url` (base64 JPEG, `detail:"low"` = low token cost) plus the system prompt, the goal, the current forward distance (used when the model is driving an approach), and the **12 most recent memory entries** (`memory.suffix(12)`). A language line (`langLine`) switches the output language of the observation. `parse(_:)` extracts from the first `{` to the last `}` and reconstructs the JSON; on failure it returns `.hold` (fail-safe). **The model only emits semantic verbs and never outputs raw motor values.**
 
 ### 2.3 Speech — STT/TTS
 
-`SFSpeechRecognizer` + `AVAudioEngine` で聞き取り(`transcript` を publish)、`AVSpeechSynthesizer` で読み上げ。`langCode`(BCP-47, `en-US`/`ja-JP`)は RobotController が言語解決結果から設定。STT ロケール・TTS ボイス・AI 返答テキストがすべて選択言語に追随する。
+Listens via `SFSpeechRecognizer` + `AVAudioEngine` (publishing `transcript`) and speaks via `AVSpeechSynthesizer`. `langCode` (BCP-47, `en-US` / `ja-JP`) is set by RobotController from the resolved language. The STT locale, the TTS voice, and the AI reply text all follow the selected language.
 
-### 2.4 RobotController — アービタ / 安全 / 言語
+### 2.4 RobotController — arbiter / safety / language
 
-全体を束ね制御ループを回す `@MainActor ObservableObject`。設定(`carIP`/`apiKey`/`model`/`lang`/`speedCap`/`linkMode`/`controlMode`/サーボ校正/`panInvert`/`motorTrim`)は `didSet` で UserDefaults へ即時永続化する。`dryRun` は安全のため毎起動 ON。言語解決: `resolvedLang`(auto なら端末ロケールから ja/en)→ `uiLocale`(環境ロケール上書き)/ `voiceCode`(TTS/STT)。ライフサイクル: `start()`(接続+`CMD_VIDEO#1`+ループ起動)、`stopAll()`、`emergencyStop()`、`setGoal(_:)`。詳細は §3。
+The `@MainActor ObservableObject` that ties everything together and runs the control loop. Settings (`carIP` / `apiKey` / `model` / `lang` / `speedCap` / `linkMode` / `controlMode` / servo calibration / `panInvert` / `motorTrim`) are persisted to UserDefaults immediately via `didSet`. `dryRun` is forced ON on every launch for safety. Language resolution: `resolvedLang` (with `auto`, ja/en from the device locale) → `uiLocale` (environment-locale override) / `voiceCode` (TTS/STT). Lifecycle: `start()` (connect + `CMD_VIDEO#1` + start the loop), `stopAll()`, `emergencyStop()`, `setGoal(_:)`. See §3 for details.
 
-### 2.5 Dispatcher — CMD_ マッピング(クランプの砦)
+### 2.5 Dispatcher — CMD_ mapping (the clamp fortress)
 
-純粋関数群。`clampMotor` が `±min(cap,4095)` にクランプし、ゼロ以外は `≥1600` へスナップ(デッドゾーン回避)。`drive(throttle:steer:speedCap:trim:)` は tank ペアへ:`left=(t+s)·cap`, `right=(t-s)·cap` → `CMD_MOTOR#left#0#right`。`stop()`=`CMD_MOTOR#0#0#0`。`look` は `CMD_SERVO` 2 発で pan/tilt の入替・中立・pan 反転を解決する。`servo`, `face`, `bodyLeds`, `buzzer`, `video`, `powerQuery`, `sonicQuery`、`faceModes` 辞書を持つ。
+A set of pure functions. `clampMotor` clamps to `±min(cap, 4095)` and snaps any non-zero value up to `≥ 1600` (avoiding the dead-zone). `drive(throttle:steer:speedCap:trim:)` lowers to a tank pair: `left = (t+s)·cap`, `right = (t-s)·cap` (with a straightness `trim` factor) → `CMD_MOTOR#left#0#right`. `stop()` = `CMD_MOTOR#0#0#0`. `look` resolves the pan/tilt swap, neutrals, and pan inversion with two `CMD_SERVO` commands. It also has `servo`, `led`, `bodyLeds`, `buzzer`, `video`, `powerQuery`, `sonicQuery`, `wifiForget`, `face`, and a `faceModes` dictionary. (`face`/`faceModes` still exist but are not driven by the live loop; see §12.1.)
 
-### 2.6 ContentView — Liquid Glass UI + 設定
+### 2.6 ContentView — Liquid Glass UI + settings
 
-詳細は第 II 部。カメラ全画面 + `.ultraThinMaterial`(iOS 26 では `.glassEffect()`)の frosted-glass HUD、`.preferredColorScheme(.dark)`。`ConfigView`(sheet)で接続・AI・サーボ校正・言語を編集。全テキストは `LocalizedStringKey` + `en.lproj`/`ja.lproj`、`.environment(\.locale, ctl.uiLocale)` で切替。
+See Part II for details. A full-screen camera with a frosted-glass HUD built from `.ultraThinMaterial` (on iOS 26, `.glassEffect()`), and `.preferredColorScheme(.dark)`. `ConfigView` (a sheet) edits connection, AI, servo calibration, and language. All text is `LocalizedStringKey` + `en.lproj` / `ja.lproj`, switched via `.environment(\.locale, ctl.uiLocale)`.
 
 ### 2.7 RobotBrainApp
 
-`@main` エントリ。ルートに `ContentView` を配置し、環境ロケールを注入する。
+The `@main` entry point. It places `ContentView` at the root and injects the environment locale.
 
 ---
 
-## 3. 制御ループ
+## 3. Control Loop
 
-`RobotController.run()` は `while !Task.isCancelled` の単一ループ。**判断カデンスと心拍カデンスを分離**する。
+`RobotController.run()` is a single loop of `while !Task.isCancelled`. It **decouples the decision cadence from the heartbeat cadence**.
 
-- **心拍(heartbeat)≈10Hz**: `heartbeatHz=10.0` → `tick=100ms`。毎ティック、アービタが車体へちょうど 1 行(駆動 or 停止)を送る。
-- **判断カデンス(decision)≈0.7Hz**: `decisionHz=0.7` → 約 1.43 秒毎。`!estop && !goal.isEmpty && 経過≥1/decisionHz && car.image` のとき Brain を呼び、`Intent` を更新。同時に `look`(§4)/`face` を送り、`observation` を TTS 読み上げ、`memory`(最大 12 件)へ追記、`taskState==done` でゴールをクリアする。`blocked` は 3 回連続でのみ終了扱い。
-- **自己満了ドライブパルス**: 判断ごとに `pulseUntil = now + durationMs/1000`。アービタは `now < pulseUntil` の間だけ駆動を送る。遅延・失敗ティックは「既に停止済み」を意味する——ラッチするモータへの根幹的安全策。
+- **Heartbeat ≈ 10 Hz**: `heartbeatHz=10.0` → `tick=100ms`. Every tick, the arbiter sends the car exactly one line (drive or stop).
+- **Decision cadence ≈ 0.7 Hz**: `decisionHz=0.7` → roughly every 1.43 s. When `!estop && !goal.isEmpty && elapsed ≥ 1/decisionHz && car.image`, it calls Brain and updates the `Intent`. At the same time it sends `look` (§4), aims the head, updates the body-LED cue, speaks the `observation` via TTS, appends to `memory` (up to 12 entries), and clears the goal when `taskState==done`. A `blocked` state is treated as terminal only after 3 in a row.
+- **Self-terminating drive pulse**: at each decision, `pulseUntil = now + durationMs/1000`. The arbiter sends drive only while `now < pulseUntil`. A late or failed tick therefore means "already stopped" — the fundamental safety measure for latching motors.
 
-### 3.1 安全反射と優先度(SAFETY > TELEOP > PLANNER)
+### 3.1 Safety reflexes and priority (SAFETY > TELEOP > PLANNER)
 
-概念優先度は **SAFETY > TELEOP > PLANNER**。本アプリはゴール駆動で明示的 TELEOP を持たないため、E-STOP を SAFETY 直下・PLANNER(パルス駆動)より上に置く。ループの実効判定:
+The conceptual priority is **SAFETY > TELEOP > PLANNER**. Because this app is goal-driven and has no explicit TELEOP, E-STOP sits directly under SAFETY and above PLANNER (pulse-drive). The loop's effective decisions:
 
-| 優先 | 反射 | 現状の判定源 | 結果 |
+| Priority | Reflex | Current decision source | Result |
 |---|---|---|---|
-| 1 SAFETY | **E-STOP** | `estop`(STOP ボタン → `emergencyStop()`) | `CMD_MOTOR#0#0#0` / `status.estop` |
-| 2 SAFETY | **link-down** | `!car.cmdConnected` | 停止 / `safety.linkDown` |
-| 2 SAFETY | **vision-stale** | `lastFrameAt` 経過 > `visionStaleMs=800` | 停止 / `safety.visionStale` |
-| 2 SAFETY | **deadman** | `lastIntentAt` 経過 > `deadmanMs=500` | 停止 / `safety.deadman` |
-| 3 SAFETY | **low-battery** | `voltage < 6.6V` | 停止 / `safety.lowBattery` + バナー |
-| 4 SAFETY | **collision-escape** | 前進意図 + fresh sonar < 25cm（暗所 32cm） | 後退→ピボット |
-| 5 —(dry-run) | **dry-run** | `dryRun`(既定 ON) | 駆動値を送らない(計画/ログのみ) |
-| 6 TELEOP | **direct/manual pulse** | 直接移動コマンド / Manual pad | 自己満了パルス |
+| 1 SAFETY | **E-STOP** | `estop` (STOP button → `emergencyStop()`) | `CMD_MOTOR#0#0#0` / `status.estop` |
+| 2 SAFETY | **link-down** | `!car.cmdConnected` | stop / `safety.linkDown` |
+| 2 SAFETY | **vision-stale** | `lastFrameAt` elapsed > `visionStaleMs=800` | stop / `safety.visionStale` |
+| 2 SAFETY | **deadman** | `lastIntentAt` elapsed > `deadmanMs=500` | stop / `safety.deadman` |
+| 3 SAFETY | **low-battery** | `voltage < 6.6V` | stop / `safety.lowBattery` + banner |
+| 4 SAFETY | **collision-escape** | forward intent + fresh sonar < 25 cm (32 cm in the dark) | reverse → pivot |
+| 5 — (dry-run) | **dry-run** | `dryRun` (default ON) | do not send drive values (plan/log only) |
+| 6 TELEOP | **direct/manual pulse** | direct move command / Manual pad | self-terminating pulse |
 | 7 PLANNER | **AI pulse-drive** | `reason==nil && now<pulseUntil` | `Dispatcher.drive(...)` |
-| 8 — | **hold** | 上記いずれでもない | `CMD_MOTOR#0#0#0` / `status.hold` |
+| 8 — | **hold** | none of the above | `CMD_MOTOR#0#0#0` / `status.hold` |
 
-`safetyReason() -> String?` が nil 以外(ローカライズキー)を返すと駆動をブロック。`driving = !estop && reason==nil && now<pulseUntil`。**モーションはバッテリ時のみ**、かつ dry-run OFF 時のみ実送信。dry-run は既定 ON で計画とログを行い、運動指令を絶対に送らない。停止はネットワーク往復や AI 判断に依存せず、アプリ内で即時完結する。
+`safetyReason() -> String?` blocks driving whenever it returns non-nil (a localization key). `driving = !estop && reason==nil && now<pulseUntil`. **Motion happens only when on battery**, and only when dry-run is OFF is it actually transmitted. Dry-run defaults ON: it plans and logs but never sends a motion command. Stopping does not depend on a network round-trip or an AI decision — it completes immediately inside the app.
 
-### 3.2 低バッテリ反射(実装済)
+### 3.2 Low-battery reflex (implemented)
 
-RobotController は約 3 秒ごとに `CMD_POWER` を送信し、CarLink が `CMD_POWER#<voltage>\n` を解析して `voltage` を publish する。`safetyReason()` は `voltage < 6.6` で `safety.lowBattery` を返し、アービタは停止を出す。ContentView は電圧バッジと赤い低電圧バナーで理由を見せる。
+RobotController sends `CMD_POWER` roughly every 3 seconds; CarLink parses `CMD_POWER#<voltage>\n` and publishes `voltage`. `safetyReason()` returns `safety.lowBattery` when `voltage < 6.6`, and the arbiter emits a stop. ContentView shows the reason with a voltage badge and a red low-voltage banner.
 
-最終防衛線は車載側の低電圧検知であり、ホスト側は早期警告と自主停止を担う。
+The last line of defense is the on-board low-voltage detection; the host side handles early warning and voluntary stop.
 
-### 3.3 探索状態機械（スキャン＆リロケート, FR-54〜56）— 2026-07-26
+### 3.3 Search state machine (scan & relocate, FR-54–56) — 2026-07-26
 
-**問題**: 探索の構造を VLM プロンプト任せにすると、実車で「止まって首を振る」だけで新地点へ移動して探し直さない（gpt-4o-mini が屋内で衝突を恐れ RELOCATE を選ばない）。**衝突回避とは別軸**の欠落だった。
+**Problem**: If the structure of the search is left to the VLM prompt, on the real car it just "stops and sweeps the head" and never moves to a new spot to search again (gpt-4o-mini fears collisions indoors and won't choose to RELOCATE). This is a missing axis, **separate from collision avoidance**.
 
-**方針**: 衝突脱出（§3.4 相当の `collisionEscape`）と同じく、探索の骨格を**ホスト側の決定論的状態機械**で保証する。VLM の役割は「ゴールが視界にあるか」の**知覚判断のみ**へ縮小。`applyIntent` 内で `task_state` を見て分岐:
+**Approach**: Just like collision escape (`collisionEscape`, roughly §3.4), guarantee the skeleton of the search with a **deterministic, host-side state machine**. The VLM's role is narrowed to a **pure perceptual judgment**: "is the goal in view?" Inside `applyIntent`, it branches on `task_state`:
 
-- `task_state == approaching|done` → 探索機械を解除、VLM の `Intent`（throttle/steer/pan/tilt）をそのまま適用（接近・到達は VLM 担当）。`searchPhase` をリセット。
-- それ以外（`searching|blocked`）→ **ホストが `Intent` を上書き**（VLM の駆動値は破棄、`observation/taskState` のみ利用）。
+- `task_state == approaching|done` → release the search machine and apply the VLM's `Intent` (throttle/steer/pan/tilt) directly (the VLM owns approach and arrival). Reset `searchPhase`.
+- otherwise (`searching|blocked`) → **the host overrides the `Intent`** (the VLM's drive values are discarded; only `observation/taskState` are used).
 
-状態（判断カデンス＝約1.43秒毎に1ステップ進む）:
+States (one step advances per decision cadence ≈ every 1.43 s):
 
-| phase | 動作 | 遷移 |
+| phase | action | transition |
 |---|---|---|
-| **scan** | 停止（throttle 0）、頭部 pan/tilt を `scanArc[i]` へ。VLM が各角度で視認判定。 | `i` を進める。アーク一巡（`i` 一周）で **relocate** へ |
-| **relocate** | 頭部を正面（`fwdPan`/`driveTilt`）へ。①首がまだ正面でなければ（`!headForward`）停止のまま首を正面へ向け、次tickで測距。②正面確定後、前方 `≥ relocateClearCm(45cm)` なら短い前進パルス（throttle 0.45, 350ms）で新地点へ。③塞がっていればその場ピボット（steer, throttle 0, 350ms）で進行方向を変える。 | 1アクション後 **scan** へ |
+| **scan** | Stop (throttle 0), aim the head pan/tilt to `scanArc[i]`. The VLM judges visibility at each angle. | Advance `i`. When the arc is fully covered (`i` wraps), go to **relocate** |
+| **relocate** | Face the head forward (`fwdPan`/`driveTilt`). ① If the head is not yet forward (`!headForward`), stay stopped and turn the head forward, measuring distance on the next tick. ② Once forward is confirmed, if the path ahead is `≥ relocateClearCm(45 cm)`, drive a short forward pulse (throttle 0.45, 350 ms) to a new spot. ③ If blocked, pivot in place (steer, throttle 0, 350 ms) to change heading. | After 1 action, go to **scan** |
 
-- `scanArc` は本個体の**可動半球内**の pan 数点＋tilt 上下（例 `[(90,88),(70,92),(115,92),(90,80)]`、実車で要調整）。頭部は 360° 回れないので、届かない方位は relocate のピボットで body ごと向き直してカバーする。
-- **安全従属（FR-56）**: 探索機械は `Intent` を作るだけで、最終的な motor 行は §3.1 のアービタが決める。E-STOP/link/vision/deadman/低電圧/dry-run はすべて上位。RELOCATE の前進はファーム前進 veto（<20cm）＋ホスト `collisionEscape`（<25cm でラッチ後退→旋回）に守られる。`relocateClearCm(45)` を `collisionEscape` engage(25) より大きく取り、通常は探索側で先に止まる。
-- **明け渡し/リセット（FR-55）**: `setGoal`/`stopAll`/`emergencyStop`/モード切替/`start` で `searchPhase=.scan, scanIndex=0`。
-- **プロンプト**: 「ホストが首振りと移動を担う。`searching` の間あなたの throttle/steer/pan は無視される。ゴールが**見えたら** `approaching` にして向き、**見えなければ** `searching` のまま所見を述べよ」に縮小（`Brain.swift`）。これにより VLM の判断が単純化し安定する。
+- `scanArc` is a few pan points plus tilt up/down **within this unit's reachable hemisphere** (e.g. `[(90,130),(45,88),(90,45),(135,88),(90,83)]`, to be tuned on the real car). The head cannot turn 360°, so headings it cannot reach are covered by turning the whole body during a relocate pivot.
+- **Safety subordination (FR-56)**: the search machine only builds an `Intent`; the final motor line is decided by the §3.1 arbiter. E-STOP / link / vision / deadman / low-voltage / dry-run all sit above it. A RELOCATE forward pulse is protected by the firmware forward veto (< 20 cm) plus the host `collisionEscape` (latched reverse → turn below 25 cm). `relocateClearCm(45)` is set larger than `collisionEscape`'s engage point (25) so the search side normally stops first.
+- **Yield / reset (FR-55)**: `setGoal` / `stopAll` / `emergencyStop` / mode switch / `start` set `searchPhase=.scan, scanIndex=0`.
+- **Prompt**: narrowed to "the host handles head-sweeping and movement; while `searching`, your throttle/steer/pan are ignored; if you **can see** the goal set `approaching` and aim toward it, and if you **cannot** keep `searching` and describe what you see" (`Brain.swift`). This simplifies and stabilizes the VLM's decisions.
 
-### 3.4 衝突脱出・低照度モード・物理限界
+### 3.4 Collision escape, low-light mode, physical limits
 
-- **HC-SR04**: ファームは `CMD_SONIC#<cm>` を返し、20cm 未満の前進を車載側で拒否する。アプリは約 3Hz で距離を取得し、鮮度 1.5 秒以内の値だけを使う。
-- **ホスト衝突脱出**: 前進意図かつ fresh sonar < 25cm（低照度時 32cm）で 10Hz アービタが `collisionEscape` をラッチする。後退は 40cm 超または 1.4 秒で終え、0.65 秒のその場ピボットで向きを変える。後退中は後方センサがないため最大時間を必ず持つ。
-- **低照度**: フレーム平均輝度 `luma < 55` で低照度。白 LED を headlight として点灯し、探索リロケートは `clear=65cm`、`throttle=0.30`、`duration=250ms` へ落とす。
-- **限界**: HC-SR04 はヘッド正面のみで、後方・側方・床端・階段・低い/柔らかい/細い/斜め/ガラス/布/no echo 障害物を保証しない。no echo は安全を意味しない。運用は低速・短パルス・監視付きが前提。
+- **HC-SR04**: the firmware returns `CMD_SONIC#<cm>` and vetoes forward drive under 20 cm on the chassis side. The app polls distance at about 3 Hz and only uses values fresher than 1.5 s.
+- **Host collision escape**: on forward intent with a fresh sonar reading < 25 cm (32 cm in low light), the 10 Hz arbiter latches `collisionEscape`. The reverse ends past 40 cm or at 1.4 s, followed by a 0.65 s in-place pivot to change heading. Because there is no rear sensor while reversing, there is always a maximum time cap.
+- **Low light**: the frame is "dark" when the average luma `luma < 55`. A white LED is turned on as a headlight, and the search relocate is dialed down to `clear=65 cm`, `throttle=0.30`, `duration=250 ms`.
+- **Limits**: the HC-SR04 covers only straight ahead of the head; it does not guarantee anything behind, to the sides, at floor edges, on stairs, or for low/soft/thin/angled/glass/cloth/no-echo obstacles. "No echo" does not mean safe. Operation assumes low speed, short pulses, and human supervision.
 
 ---
 
-## 4. サーボキャリブレーションモデル(swap フラグ + pan/tilt ニュートラル)
+## 4. Servo Calibration Model (swap flag + pan/tilt neutrals)
 
-**再フラッシュではなくアプリ内で調整可能**であることが必須。本機固有の実測事実(`PROGRESS.md` 2026-07-24):
+It is a hard requirement that this be **adjustable in-app rather than by reflashing**. Facts measured on this specific unit:
 
-- **pan/tilt サーボがファーム想定と入替**: `servo1(ch0)=TILT(上下)`、`servo2(ch1)=PAN(左右)`(servo2 を 80→180 にすると頭が 90° 左へ回り、上下は不変)。
-- **ニュートラル**: pan(前方)≈ 90、tilt(水平)≈ 95。意味空間では tilt 90 が水平、90 超が上、90 未満が下。
-- 古い `tiltNeutral=18` は床向きに寄りすぎ、走行時に sonar が床を見る原因になったため、現行アプリは `tiltCalV<3` を 95 へ移行する。
+- **The pan/tilt servos are swapped relative to the firmware's assumption**: `servo1(ch0)=TILT (up/down)`, `servo2(ch1)=PAN (left/right)` (setting servo2 from 80→180 rotates the head 90° to the left with no change in up/down).
+- **Neutrals**: pan (forward) ≈ 90, tilt (level) ≈ 95. In the semantic space, tilt 90 is level, above 90 is up, below 90 is down.
+- The old `tiltNeutral=18` pointed too far toward the floor and caused the sonar to look at the ground while driving, so the current app migrates any `tiltCalV < 3` to 95.
 
-現行 `Dispatcher.look()` は `CMD_CAMERA` を使わず、**個別サーボ指令 `CMD_SERVO#index#angle`** 2 本で降ろす。Servo_2 の pan 側はファーム再フラッシュで 0〜180 全域になっている。
+The current `Dispatcher.look()` does not use `CMD_CAMERA`; it lowers to two **individual servo commands `CMD_SERVO#index#angle`**. On this car's firmware the servo2 pan axis has been reflashed to span the full 0–180 range.
 
-### 4.1 キャリブレーション状態(データモデル・永続化)
+### 4.1 Calibration state (data model, persistence)
 
-| プロパティ | 型 | 既定(本機) | 意味 |
+| Property | Type | Default (this unit) | Meaning |
 |---|---|---|---|
-| `servoSwap` | Bool | `true` | true=pan は ch1・tilt は ch0(本機)/ false=ファーム既定 |
-| `panNeutral` | Int | `90` | 前方を向く物理角 |
-| `tiltNeutral` | Int | `95` | 水平を向く物理角 |
-| `panInvert` | Bool | `false` | pan 方向反転 |
-| `motorTrim` | Double | `0` | 直進補正 |
+| `servoSwap` | Bool | `true` | true = pan on ch1, tilt on ch0 (this unit) / false = firmware default |
+| `panNeutral` | Int | `90` | physical angle that faces forward |
+| `tiltNeutral` | Int | `95` | physical angle that is level |
+| `panInvert` | Bool | `false` | invert the pan direction |
+| `motorTrim` | Double | `0` | straight-line correction |
 
-いずれも `carIP` と同じ `didSet` パターンで UserDefaults へ永続化する(§5)。
+All are persisted to UserDefaults with the same `didSet` pattern as `carIP` (§5).
 
-### 4.2 チャネル解決
-
-```
-panChannel  = servoSwap ? 1 : 0   // 本機: pan は ch1(servo2)
-tiltChannel = servoSwap ? 0 : 1   // 本機: tilt は ch0(servo1)
-```
-
-### 4.3 意味角 → 物理角(ニュートラル中心・90=中立)
-
-皮質(Brain)の意味空間はハード癖から切り離し、**pan/tilt とも 90 を中立**とする。ニュートラルからのオフセットとして写像:
+### 4.2 Channel resolution
 
 ```
-physPan  = clamp(panNeutral  + (semPan  - 90), 0, 180)   // panInvert 時は -(semPan-90)
-physTilt = clamp(tiltNeutral + (semTilt - 90), 0, 180)   // 小=下/大=上、方向はそのまま
+panChannel  = servoSwap ? 1 : 0   // this unit: pan on ch1 (servo2)
+tiltChannel = servoSwap ? 0 : 1   // this unit: tilt on ch0 (servo1)
 ```
 
-これにより AI は通常の 90 中心空間で考え、`tiltNeutral=95` を通して物理的な水平に着地でき、`CMD_CAMERA` の固定軸割り当てに依存しない。
+### 4.3 Semantic angle → physical angle (centered on neutral; 90 = neutral)
 
-### 4.4 `look(pan,tilt)` の降下(2 指令発行)
+The cortex's (Brain's) semantic space is decoupled from the hardware quirks: **90 is neutral for both pan and tilt**. The mapping is an offset from neutral:
+
+```
+physPan  = clamp(panNeutral  + (semPan  - 90), 0, 180)   // -(semPan-90) when panInvert
+physTilt = clamp(tiltNeutral + (semTilt - 90), 0, 180)   // smaller = down / larger = up, no flip
+```
+
+This lets the AI think in a normal 90-centered space, land on physical level through `tiltNeutral=95`, and not depend on `CMD_CAMERA`'s fixed axis assignment.
+
+### 4.4 Lowering `look(pan,tilt)` (emits 2 commands)
 
 ```swift
 static func look(pan semPan: Int, tilt semTilt: Int,
-                 swap: Bool, panNeutral: Int, tiltNeutral: Int) -> [String] {
+                 swap: Bool, panNeutral: Int, tiltNeutral: Int,
+                 panInvert: Bool = false) -> [String] {
     let panCh  = swap ? 1 : 0
     let tiltCh = swap ? 0 : 1
-    let physPan  = max(0, min(180, panNeutral  + (semPan  - 90)))
+    let panDelta = panInvert ? -(semPan - 90) : (semPan - 90)   // flip pan direction for this car
+    let physPan  = max(0, min(180, panNeutral  + panDelta))
     let physTilt = max(0, min(180, tiltNeutral + (semTilt - 90)))
-    return ["CMD_SERVO#\(panCh)#\(physPan)", "CMD_SERVO#\(tiltCh)#\(physTilt)"]
+    return [servo(panCh, physPan), servo(tiltCh, physTilt)]
 }
 ```
 
-RobotController は判断ティックで両行を送出(現行の単一 `CMD_CAMERA` を置換)。ライブ調整 UI(スライダ・入替トグル・正面ボタン)の詳細は第 II 部 §11.3 を参照。
+RobotController emits both lines on a decision tick (replacing the older single `CMD_CAMERA`). See Part II §11.3 for the live-adjustment UI (sliders, swap toggle, forward button).
 
 ---
 
-## 5. 状態と永続化(UserDefaults)
+## 5. State and Persistence (UserDefaults)
 
-| キー | 型 | 既定 | 現状 |
+| Key | Type | Default | Current |
 |---|---|---|---|
-| `carIP` | String | `robotbrain.local` | ✅ `didSet` で永続化(mDNS。数値 IP も可) |
-| `apiKey` | String | `""` | ✅ 永続化(平文・§8) |
-| `model` | String | `gpt-4o-mini` | ✅ 永続化 |
-| `lang` | String | `auto` | ✅ 永続化、`speech.langCode` を追随更新 |
-| `dryRun` | Bool | `true` | 非永続。毎起動 ON（安全側） |
-| `speedCap` | Int | `2000` | ✅ 永続化 |
-| `linkMode` | `lan/remote` | `lan` | ✅ 永続化 |
-| `controlMode` | `ai/manual` | `ai` | ✅ 永続化 |
-| `servoSwap` | Bool | `true` | ✅ 永続化 |
-| `panNeutral` | Int | `90` | ✅ 永続化 |
-| `tiltNeutral` | Int | `95` | ✅ 永続化 + 旧値移行 |
-| `panInvert` | Bool | `false` | ✅ 永続化 |
-| `motorTrim` | Double | `0` | ✅ 永続化 |
+| `carIP` | String | `robotbrain.local` | ✅ persisted via `didSet` (mDNS; a numeric IP also works) |
+| `apiKey` | String | `""` | ✅ persisted (plaintext, §8) |
+| `model` | String | `gpt-4o-mini` | ✅ persisted |
+| `lang` | String | `auto` | ✅ persisted; keeps `speech.langCode` in sync |
+| `dryRun` | Bool | `true` | not persisted; ON every launch (fail-safe) |
+| `speedCap` | Int | `2000` | ✅ persisted |
+| `linkMode` | `lan/remote` | `lan` | ✅ persisted |
+| `controlMode` | `ai/manual` | `ai` | ✅ persisted |
+| `servoSwap` | Bool | `true` | ✅ persisted |
+| `panNeutral` | Int | `90` | ✅ persisted |
+| `tiltNeutral` | Int | `95` | ✅ persisted + migration of the old value |
+| `panInvert` | Bool | `false` | ✅ persisted |
+| `motorTrim` | Double | `0` | ✅ persisted |
 
-ライブ状態(`goal`, `running`, `estop`, `report`, `taskState`, `statusKey`, `memory`)は非永続で正しい。
+Live state (`goal`, `running`, `estop`, `report`, `taskState`, `statusKey`, `memory`) is correctly non-persistent.
 
 ---
 
-## 6. ワイヤープロトコル参照
+## 6. Wire Protocol Reference
 
-### 6.1 コマンドチャネル TCP :4000 — CMD_ プロトコル表
+### 6.1 Command channel TCP :4000 — the CMD_ protocol table
 
-テキスト行、`#` 区切り(`INTERVAL_CHAR '#'`)、`\n`(`ENTER`)終端。CarLink が末尾 `\n` を付与。通常は fire-and-forget だが、`CMD_POWER` と `CMD_SONIC` は応答行を返す。
+Text lines, `#`-delimited (`INTERVAL_CHAR '#'`), `\n`-terminated (`ENTER`). CarLink appends the trailing `\n`. Normally fire-and-forget, but `CMD_POWER` and `CMD_SONIC` return a reply line.
 
-| 意味動作(Dispatcher) | ワイヤ文字列 | クランプ / 備考 |
+| Semantic action (Dispatcher) | Wire string | Clamp / notes |
 |---|---|---|
-| `drive(throttle,steer,speedCap)` | `CMD_MOTOR#<L>#0#<R>` | tank ペア。±min(cap,4095)、非零は ≥1600 へスナップ。中央フィールドは 0 |
-| `stop()` | `CMD_MOTOR#0#0#0` | 停止(安全既定) |
-| `servo(index,angle)` | `CMD_SERVO#<index>#<angle>` | index 0=ch0(servo1), 1=ch1(servo2)。angle 0–180。**look の降下先** |
-| `look(...)`(現行) | `CMD_CAMERA#<pan>#<tilt>` | tilt 80–180 クランプ。**本機では §4 の CMD_SERVO 2 発に置換** |
-| `face(mode)` | `CMD_MATRIX_MOD#<mode>` | 0=off,1=rotate,2=cry,3=smile,4=wheel_r,5=wheel_l,6=blink, ≥7=random |
-| `bodyLeds(mode)` | `CMD_LED_MOD#<mode>` | 0–5 |
-| `buzzer(on,freq)` | `CMD_BUZZER#<0/1>#<freq>` | freq 0–10000(非ブロッキング可変音のみ。`Buzzer_Alert` は不使用) |
-| `video(on)` | `CMD_VIDEO#<0/1>` | :7000 ストリームを gate |
-| `powerQuery()` | `CMD_POWER` | 応答: `CMD_POWER#<voltage>\n` |
-| `sonicQuery()` | `CMD_SONIC` | 応答: `CMD_SONIC#<cm>\n` |
+| `drive(throttle,steer,speedCap)` | `CMD_MOTOR#<L>#0#<R>` | Tank pair. ±min(cap,4095), non-zero snaps up to ≥1600. Middle field is 0 |
+| `stop()` | `CMD_MOTOR#0#0#0` | Stop (safe default) |
+| `servo(index,angle)` | `CMD_SERVO#<index>#<angle>` | index 0=ch0(servo1), 1=ch1(servo2). angle 0–180. **The lowering target of `look`** |
+| `look(pan,tilt)` | two `CMD_SERVO` (see §4) | The lowering emits two `CMD_SERVO`; the older single `CMD_CAMERA#<pan>#<tilt>` firmware command is not used by this build |
+| `led(mask,r,g,b)` | `CMD_LED#<mask>#<r>#<g>#<b>` | Set color_1 of the LEDs picked by a 12-bit corner bitmask (rendered by modes 1/3/4) |
+| `bodyLeds(mode)` | `CMD_LED_MOD#<mode>` | 0 off, 1 static, 3 blink, 4 breathe, 5 rainbow |
+| `buzzer(on,freq)` | `CMD_BUZZER#<0/1>#<freq>` | freq 0–10000 (non-blocking variable tone only; `Buzzer_Alert` is unused) |
+| `video(on)` | `CMD_VIDEO#<0/1>` | Gates the :7000 stream |
+| `powerQuery()` | `CMD_POWER` | Reply: `CMD_POWER#<voltage>\n` |
+| `sonicQuery()` | `CMD_SONIC` | Reply: `CMD_SONIC#<cm>\n` |
+| `wifiForget()` | `CMD_WIFI_FORGET` | Clear credentials + reboot into SoftAP setup mode |
+| `face(mode)` | `CMD_MATRIX_MOD#<mode>` | 0=off,1=rotate,2=cry,3=smile,4=wheel_r,5=wheel_l,6=blink, ≥7=random. The command exists in Dispatcher but the live control loop no longer drives the LED-matrix face (HRI is the body-LED cues; see §12.1) |
 
-`faceModes` 辞書: `off:0, rotate:1, cry:2, smile:3, wheel_r:4, wheel_l:5, blink:6, random:7`。
+`faceModes` dictionary: `off:0, rotate:1, cry:2, smile:3, wheel_r:4, wheel_l:5, blink:6, random:7`.
 
-### 6.2 カメラチャネル TCP :7000 — フレーム形式
+### 6.2 Camera channel TCP :7000 — frame format
 
-`CMD_VIDEO#1` で gate。1 フレーム = **4 バイトリトルエンディアン長プレフィクス + 生 JPEG バイト**。受信は 4 バイト読み→長さ確定→ちょうどその長さを読む(`readExact`)。HQVGA 240×176、~10–15 fps。長さは `0 < len < 4,000,000` でサニティチェック。
+Gated by `CMD_VIDEO#1`. One frame = a **4-byte little-endian length prefix + raw JPEG bytes**. Reception reads 4 bytes → determines the length → reads exactly that many (`readExact`). HQVGA 240×176, ~10–15 fps. The length is sanity-checked with `0 < len < 4,000,000`.
 
-### 6.3 ハードウェア制約(参照)
+### 6.3 Hardware constraints (reference)
 
-- ESP32-WROVER、オンデバイス ML 不可。知覚・認知はすべてオフボード。
-- モータ 4 輪だが `CMD_MOTOR` は左右タンクペア駆動。各値 ±4095、`|値|<1600` は 0(デッドゾーン)。
-- サーボは PCA9685 経由(`Servo_1`=ch0 / `Servo_2`=ch1)。本個体は pan/tilt がスワップ。
-- HC-SR04 前方距離センサは増設済み。ただしヘッド正面の単一センサであり、no echo や後方/側方/床端/柔軟物は保証しない。
-- GPIO 32 に `WS2812_PIN` と `PIN_BATTERY` の重複記載あり。ボディ LED とバッテリテレメトリの同時利用は要ハード確認(アプリはこの不確実性に依存しない)。
-- モーション・サーボ・ボディ LED はバッテリ(18650×2)搭載時のみ。低電圧目安 `LOW_VOLTAGE_VALUE 2100`。
-
----
-
-## 7. 再接続とエラーハンドリング
-
-- **CarLink 自動再接続**: `.failed` で 1 秒後に `retryCommand()`/`retryCamera()`。`.cancelled`(明示停止)は再接続しない。両チャネル独立。
-- **ファーム stop-and-hold**: パッチ済み `AI_Car_Firmware` は切断時に `ESP.restart()` せず停止保持。WiFi 瞬断で車体が再起動しない → 頭脳側は落ち着いて再接続でき、モーション途中の暴走を防ぐ。
-- **IP ドリフト**: STA/DHCP のため IP が変わる。ConfigView で手入力・再接続。
-- **視覚失効 / デッドマン**: フレーム 800ms 途絶で `visionStale`、意図 500ms 途絶で `deadman` として即停止(§3)。
-- **状態リセット**: STOP / stopAll / モード切替 / AI↔Manual 切替は `haltMotionState()` でパルス、テレオペ、衝突脱出、探索、接近ラッチ、古い taskState を消し、再開後に古い判断で再駆動しない。
-- **Brain のフェイルセーフ**: ネットワーク/JSON パース失敗はすべて `.hold` を返す。頭脳が黙れば車体は自己満了パルスで自然停止。
-- **UI 反映**: `cmdConnected`/`camConnected` を接続ドット、`statusKey` を状態ピルで可視化。
+- ESP32-WROVER; no on-device ML. All perception and cognition are off-board.
+- Four motorized wheels, but `CMD_MOTOR` drives a left/right tank pair. Each value is ±4095; `|value| < 1600` is 0 (dead-zone).
+- Servos via a PCA9685 (`Servo_1`=ch0 / `Servo_2`=ch1). On this unit the pan/tilt are swapped.
+- The forward HC-SR04 distance sensor is an add-on. It is a single sensor facing straight ahead of the head and does not guarantee no-echo, rear, side, floor-edge, or soft-object detection.
+- There is an overlap in the docs between `WS2812_PIN` and `PIN_BATTERY` on GPIO 32. Using the body LEDs and battery telemetry at the same time needs hardware verification (the app does not rely on that uncertainty).
+- Motion, servos, and body LEDs only work when the battery (2× 18650) is fitted. Low-voltage reference `LOW_VOLTAGE_VALUE 2100`.
 
 ---
 
-## 8. セキュリティ
+## 7. Reconnection and Error Handling
 
-- **OpenAI API キー**: UserDefaults に**平文**保存(個人利用の割り切り)。ハードコードしない(現状も未ハードコード、SecureField 入力)。より強固にするなら Keychain 移行が推奨(現行仕様は UserDefaults を明示採用)。
-- **LAN 通信**: :4000/:7000 は平文 TCP、TLS/認証なし。家庭内 LAN 前提。信頼できないネットワークでは使わない。
-- **URL/クエリに秘匿情報を載せない**: API キーは HTTP ヘッダ(`Authorization: Bearer`)のみ。画像は base64 で本文送信。
-- **運用ガード**: dry-run 既定 ON、常時利用可能な緊急 STOP、速度ガバナ(`speedCap`)、屋内・階段なし・人の監視下での運用。モーションはバッテリ接続時のみ物理的に発生。
-
----
-
-# 第 II 部　UX・画面・多言語設計
-
-現行 `ContentView.swift` の構造(`glass()` モディファイア、`MainView` の各パネル、`ConfigView` の `Form`)と `en.lproj`/`ja.lproj` を土台に、第 I 部 §4 のサーボキャリブレーションを含めて拡張する設計として記述する。
+- **CarLink auto-reconnect**: on `.failed`, `retryCommand()` / `retryCamera()` after 1 second. `.cancelled` (an explicit stop) does not reconnect. The two channels are independent.
+- **Firmware stop-and-hold**: the patched `AI_Car_Firmware` does not `ESP.restart()` on disconnect; it holds a stop. A brief WiFi drop does not reboot the chassis → the brain can calmly reconnect, preventing a runaway mid-motion.
+- **IP drift**: with STA/DHCP the IP changes. Enter it manually in ConfigView and reconnect.
+- **Vision-stale / deadman**: a frame gap of 800 ms is `visionStale`, an intent gap of 500 ms is `deadman`, and each triggers an immediate stop (§3).
+- **State reset**: STOP / stopAll / mode switch / AI↔Manual switch call `haltMotionState()` to clear the pulse, teleop, collision escape, search, approach latch, and stale taskState, so nothing re-drives on an old decision after resuming.
+- **Brain fail-safe**: any network or JSON-parse failure returns `.hold`. If the brain goes silent, the car naturally stops via the self-terminating pulse.
+- **UI reflection**: `cmdConnected` / `camConnected` show as connection dots, and `statusKey` as a status pill.
 
 ---
 
-## 9. 設計原則
+## 8. Security
 
-- **カメラが世界、ガラスが操縦席。** 画面全体は車体の一人称視点。操作系は `.ultraThinMaterial`(iOS 26 では `.glassEffect()`)のフローティングパネルとして最小限だけ浮かべる。映像を隠さない。
-- **脳はアプリ側。** ESP32 は身体＋反射のみ。UI はゴールを与える／AI の思考(observation)を読む・聞く／即座に止める、の 3 点に集約。レイテンシは許容。
-- **安全が UI の最上位。** Dry-run 既定 ON、常設 STOP、ステータスに安全理由(`safety.*`)を必ず可視化。動作はバッテリ接続時のみ。「今できない／確認できない」ことは UI 上でも正直に表示する(例: `safety.linkDown` を隠さない)。
-- **完全バイリンガル。** UI・AI 返答テキスト・TTS 音声・STT 認識ロケールがすべて同一の選択言語(Auto/EN/JA)に追従する。ハードコード文言ゼロ。
+- **OpenAI API key**: stored in UserDefaults **in plaintext** (a pragmatic choice for personal use). It is not hard-coded (it currently is not; it is entered via a SecureField). For stronger protection, migrating to the Keychain is recommended (the current spec explicitly chooses UserDefaults).
+- **LAN traffic**: :4000/:7000 are plaintext TCP with no TLS/auth. Assumes a home LAN. Do not use on an untrusted network.
+- **Never put secrets in the URL/query**: the API key is only in an HTTP header (`Authorization: Bearer`). Images are sent as base64 in the request body.
+- **Operational guards**: dry-run defaults ON, an always-available emergency STOP, a speed governor (`speedCap`), and operation indoors, without stairs, under human supervision. Motion physically occurs only when the battery is connected.
 
 ---
 
-## 10. 画面インベントリ
+# Part II — UX, Screens, and Localization Design
 
-| 画面 | 役割 | 現状 |
+This is written as a design that builds on the structure of the current `ContentView.swift` (the `glass()` modifier, `MainView`'s panels, `ConfigView`'s `Form`) and `en.lproj` / `ja.lproj`, extending it to include the servo calibration of Part I §4.
+
+---
+
+## 9. Design Principles
+
+- **The camera is the world; the glass is the cockpit.** The whole screen is the car's first-person view. Controls float minimally as `.ultraThinMaterial` (on iOS 26, `.glassEffect()`) panels. Do not hide the video.
+- **The brain is in the app.** The ESP32 is body and reflexes only. The UI reduces to three things: give a goal / read and hear the AI's thinking (observation) / stop instantly. Latency is tolerated.
+- **Safety is the top of the UI.** Dry-run defaults ON, STOP is permanent, and the status always surfaces the safety reason (`safety.*`). Motion happens only when the battery is connected. Be honest in the UI about what "can't be done / can't be verified" right now (e.g. never hide `safety.linkDown`).
+- **Fully bilingual.** The UI, AI reply text, TTS voice, and STT recognition locale all follow the same selected language (Auto/EN/JA). Zero hard-coded strings.
+
+---
+
+## 10. Screen Inventory
+
+| Screen | Role | Current |
 |---|---|---|
-| **メイン HUD**(`MainView`) | 常時表示の操縦画面 | 実装済み |
-| **設定シート**(`ConfigView`, `.sheet`) | 接続・Remote/LAN・AI・言語・**サーボ調整** | 実装済み |
-| **キャリブレーション領域**(設定内 Section) | パン/チルト中立・入替・pan反転・motorTrimをライブ調整 | LAN モードで実装済み |
-| 権限プロンプト(OS 標準) | ローカルネット／マイク／音声認識 | OS 標準ダイアログ |
+| **Main HUD** (`MainView`) | Always-on driving screen | Implemented |
+| **Settings sheet** (`ConfigView`, `.sheet`) | Connection · Remote/LAN · AI · language · **servo calibration** | Implemented |
+| **Calibration area** (a Section in Settings) | Live-adjust pan/tilt neutrals, swap, pan-invert, motorTrim | Implemented in LAN mode |
+| Permission prompts (OS standard) | Local network / mic / speech recognition | OS standard dialogs |
 
-### 10.1 メイン Liquid-Glass HUD
+### 10.1 Main Liquid-Glass HUD
 
-`ZStack` で最背面にカメラ、`GridOverlay`(3×3, opacity 0.35)、その上に `VStack(spacing: 12)`。上から下へ視線動線を作る。
+A `ZStack` with the camera at the back, `GridOverlay` (3×3, opacity 0.35), and a `VStack(spacing: 12)` on top. It creates a top-to-bottom gaze flow.
 
 ```
 ┌─────────────────────────────────────┐
-│ ● cmd  ● cam  status  [DRY]   ⚙︎     │ ← statusPill(上端・接続と安全状態)
-│ 240×176 · pan 90° · tilt 100°       │ ← telemetry(左寄せ・小さく)
-│                                     │
-│            (ライブカメラ)             │
-│         3×3 グリッド薄く重畳           │
+│ ● cmd  ● cam  status  6.4V  [DRY]  ⚙︎│ ← statusPill (top; connection + safety state)
+│ 240×176 · pan 90° · tilt 100° · 42cm │ ← telemetry (left-aligned, small)
+│ [  AI  |  Manual  ]                  │ ← modeToggle (AI / Manual segmented)
+│            (live camera)            │
+│         3×3 grid faintly overlaid    │
 │                                     │
 │ ┌─ SEARCHING ──────────────────┐    │
-│ │ 前方に赤いブロックが見えます…    │    │ ← reportCard(AIの思考＋状態)
+│ │ A red block is visible ahead…│    │ ← reportCard (AI thinking + state)
 │ └──────────────────────────────┘    │
-│ [ ロボットに指示を…      ] [🎤] [送信]│ ← inputBar(text + mic + send)
-│ [ ■ 停止 ]                          │ ← stopButton(大・赤・常設)
+│ [ Tell the robot…       ] [🎤] [Send]│ ← inputBar (text + mic + send)
+│ [ ■ STOP ]                          │ ← stopButton (large, red, permanent)
 └─────────────────────────────────────┘
 ```
 
-- **statusPill**(上端 `glass(20)`): `cmd`/`cam` の緑赤ドット、`ctl.statusKey`(`status.*` / `safety.*`)を monospaced 表示、Dry-run 時は黄 `DRY` バッジ、右端に歯車(`a11y.settings`)。**接続・安全・モードの一目確認器**。
-- **telemetry**(`glass(12)`, 左寄せ): 解像度、現在の pan/tilt 角、前方距離（cm / no echo / 不明）を表示する。値は LAN/Remote の現在トランスポートからミラーする。
-- **reportCard**(`glass()`, 下寄せ): タスク状態ラベル(`state.searching/approaching/done/blocked/idle`)＋ `ctl.report`(AI の `observation`)。**AI が「今なにを見て、なにをしようとしているか」の主説明面**。空なら `…`。
-- **inputBar**: `TextField`(`goal.placeholder`, `axis: .vertical` で複数行)＋ マイクボタン(`mic`/`mic.fill`, 聴取中は赤)＋ 送信ボタン(青ガラス、空文字で `disabled`)。テキストと音声の**入力二経路を同一バーに統合**。
-- **stopButton**: 画面下端いっぱいの赤ガラス(高さ 56)。`stop.fill` + `btn.stop`。**親指の届く常設・最大タップ域**。押下＝ `emergencyStop()`(estop フラグ＋即 `CMD_MOTOR#0#0#0`＋`status.estop`)。
+- **statusPill** (top, `glass(20)`): green/red `cmd`/`cam` dots, `ctl.statusKey` (`status.*` / `safety.*`) in monospaced, a cyan `REMOTE` badge in Remote mode, a voltage badge (red when low), a yellow `DRY` badge in dry-run, and a gear at the right (`a11y.settings`). **The at-a-glance indicator of connection, safety, and mode.**
+- **telemetry** (`glass(12)`, left-aligned): resolution, current pan/tilt angles, and the forward distance (cm / no echo / unknown). Values mirror the current transport (LAN or Remote).
+- **modeToggle** (`glass(14)`): a segmented AI / Manual `Picker`. In Manual mode it replaces the goal input with drive/camera pads.
+- **reportCard** (`glass()`, bottom-aligned): a task-state label (`state.searching/approaching/done/blocked/idle`) plus `ctl.report` (the AI's `observation`). **The primary surface for "what the AI sees and intends now."** Shows `…` when empty.
+- **inputBar**: a `TextField` (`goal.placeholder`, multiline via `axis: .vertical`) + a mic button (`mic`/`mic.fill`, red while listening) + a send button (blue glass, `disabled` on empty). **Unifies the two input paths — text and voice — into one bar.**
+- **stopButton**: full-width red glass at the bottom (height 56). `stop.fill` + `btn.stop`. **A permanent, maximal tap target within thumb reach.** Pressing it = `emergencyStop()` (estop flag + immediate `CMD_MOTOR#0#0#0` + `status.estop`).
 
-### 10.2 設定シート(`ConfigView`)
+### 10.2 Settings sheet (`ConfigView`)
 
-`NavigationStack > Form`。接続、Remote/LAN、AI、言語、LAN 限定のキャリブレーションセクションを持つ。
+`NavigationStack > Form`. It has sections for connection, Remote/LAN, AI, language, and a LAN-only calibration section.
 
-1. **車体**(`settings.section.car`): Link mode、Car IP（LAN 時）、車を探す、速度上限 `Stepper`(1600〜4095, ステップ 100)、Dry-run トグル。Remote で dry-run OFF にする時は確認ダイアログを出す。
-2. **AI**(`settings.section.ai`): API キー(`SecureField`)、モデル。フッターに「UserDefaults 保存・非暗号化・個人利用限定」の注記を追加。
-3. **サーボ調整**(`settings.section.calib`) — LAN 時のみ表示。§11.3。
-4. **言語**(`settings.section.language`): `Picker` Auto/English/日本語。
-5. アクション: 再接続 / すべて停止(destructive)／ 完了。
+1. **Car** (`settings.section.car`): Link mode, Car IP (in LAN), Find car, a speed-cap `Stepper` (1600–4095, step 100), and a Dry-run toggle. Turning dry-run OFF in Remote raises a confirmation dialog.
+2. **AI** (`settings.section.ai`): API key (`SecureField`), model. A footer note ("stored in UserDefaults, unencrypted, personal use only") is recommended.
+3. **Servo calibration** (`settings.section.calib`) — shown only in LAN. See §11.3.
+4. **Language** (`settings.section.language`): a `Picker` for Auto/English/日本語.
+5. Actions: Reconnect / Stop all (destructive) / Done.
 
 ---
 
-## 11. Liquid Glass ビジュアルシステム
+## 11. Liquid Glass Visual System
 
-- **マテリアル**: パネルは `.ultraThinMaterial`(iOS 26 実機では `.glassEffect()` へ差し替え可)。角丸は `RoundedRectangle(style: .continuous)`。半径はパネル役割で階層化: telemetry `12` < pill `20` < inputBar/reportCard `22` < STOP `26`(重要度＝大きさ＝角丸)。
-- **ボーダー**: 全ガラスに `strokeBorder(.white.opacity(0.25), lineWidth: 0.5)`。青送信ボタン/赤 STOP は `opacity(0.3〜0.35)` の白縁。
-- **レイアウト**: 外周 `.padding()`、パネル間 `spacing: 12`。上(状態)→中央(映像)→下(思考・入力・停止)の縦動線。`Spacer()` で reportCard 以下を下端集約＝親指操作圏に。カメラは `ignoresSafeArea()` で全面。
-- **暗い世界**: アプリ全体 `.preferredColorScheme(.dark)` 固定。文字は基本 `.white`、副次情報は `opacity(0.8〜0.9)`。無映像時は黒地＋`video.none`。**ライト/ダーク切替は行わない**(映像上ガラスの一貫した暗い操縦席として意図的に単一デザイン)。
-- **タイポグラフィ**: 状態値は `.monospaced()`(pill・telemetry)。reportCard は状態ラベル `caption2.bold`＋本文 `subheadline`、送信 `subheadline.weight(.semibold)`、STOP `title3.bold`。
-- **オーバーレイ**: `GridOverlay`(白 0.5pt・3×3・opacity 0.35)で第三分割ガイド。AI の視覚判断(左右/中央)を人が追いやすくする。将来はキャリブレーション中に中心十字を強調する拡張余地あり。
-- **アイコン**: App Icon はロボットのレンダー(`Assets.xcassets/AppIcon`, 1024²)。暗い世界観と一致。
+- **Material**: panels are `.ultraThinMaterial` (on iOS 26 hardware, swappable for `.glassEffect()`). Corners use `RoundedRectangle(style: .continuous)`. Radii are tiered by panel role: telemetry `12` < pill `20` < inputBar/reportCard `22` < STOP `26` (importance = size = radius).
+- **Border**: all glass uses `strokeBorder(.white.opacity(0.3), lineWidth: 0.5)`. The blue send button and red STOP use a white border at `opacity(0.3–0.35)`. Under the frosted material there is also a dark scrim (`Color.black.opacity(0.42)`) so white text stays legible over any frame.
+- **Layout**: outer `.padding()`, `spacing: 12` between panels. The vertical flow is top (state) → center (video) → bottom (thinking, input, stop). A `Spacer()` gathers the reportCard and below toward the bottom (into the thumb zone). The camera is full-bleed via `ignoresSafeArea()`.
+- **A dark world**: the whole app is fixed to `.preferredColorScheme(.dark)`. Text is mostly `.white`, with secondary info at `opacity(0.8–0.9)`. With no video it shows a black field plus `video.none`. **There is no light/dark toggle** — it is deliberately a single design, a consistently dark cockpit of glass over video.
+- **Typography**: status values are `.monospaced()` (pill, telemetry). The reportCard uses a `caption2.bold` state label plus a `subheadline` body; send is `subheadline.weight(.semibold)`; STOP is `title3.bold`.
+- **Overlay**: `GridOverlay` (white 0.5pt, 3×3, opacity 0.35) as a rule-of-thirds guide, helping a person follow the AI's visual judgments (left/right/center). A future extension could emphasize a center crosshair during calibration.
+- **Icon**: the App Icon is a render of the robot (`Assets.xcassets/AppIcon`, 1024²), matching the dark aesthetic.
 
-### 11.1 テキストでゴールを与える
+### 11.1 Giving a goal by text
 
-`TextField` に入力 → 送信タップ → `ctl.setGoal(goalText)`(trim→空でなければ `goal` 設定・estop 解除・memory クリア・未起動なら `start()`)→ `goalText=""`。以降ループが decisionHz(0.7Hz) で判断開始。
+Type in the `TextField` → tap send → `ctl.setGoal(goalText)` (trim → if non-empty, set `goal`, clear estop, clear memory, and `start()` if not running) → `goalText=""`. From then on the loop begins deciding at `decisionHz` (0.7 Hz).
 
-### 11.2 音声でゴールを与える
+### 11.2 Giving a goal by voice
 
-マイクタップ → 初回は `requestPermissions()`(音声認識＋マイク)→ `startListening()`(選択言語ロケール `langCode` の `SFSpeechRecognizer`)。部分認識が `speech.transcript` に流れ、`onChange` で `goalText` にライブ反映(口述→画面で確認→送信 or 修正)。最終結果 or エラーで自動 `stopListening()`。聴取中はマイク赤(`mic.fill`)。
+Tap the mic → on first use `requestPermissions()` (speech recognition + mic) → `startListening()` (an `SFSpeechRecognizer` with the selected-language locale `langCode`). Partial recognition streams into `speech.transcript`, mirrored live into `goalText` via `onChange` (dictate → verify on screen → send or edit). It auto-calls `stopListening()` on the final result or an error. While listening the mic is red (`mic.fill`).
 
-### 11.3 サーボ調整領域(新規・本設計の核)
+### 11.3 Servo calibration area (new; the core of this design)
 
-**背景**: 本個体はパン/チルトがファーム想定と入れ替わっている(§4)。servo1(ch0)=チルト(上下)、servo2(ch1)=パン(左右)。パン中立(正面)≈90、チルト水平≈95。再フラッシュせず**アプリ内で**補正する。
+**Background**: on this unit the pan/tilt are swapped relative to the firmware's assumption (§4). servo1(ch0)=tilt (up/down), servo2(ch1)=pan (left/right). Pan neutral (forward) ≈ 90, tilt level ≈ 95. Correct it **in-app** without reflashing.
 
-**UI 構成(`Form` の 1 セクション)**:
+**UI (one Section of the `Form`)**:
 
-- **入替トグル** `calib.swap`(`a11y.calib.swap`): 意味的 pan/tilt を物理チャンネル 0/1 のどちらへ送るかを反転。本個体では ON。
-- **pan 反転トグル** `calib.panInvert`: 左右の意味と物理角度の増減が逆に感じる場合に pan 軸だけ反転する。
-- **パン中立スライダ** `calib.pan`(0〜180, 既定 90): つまみを動かすと**その場で** `CMD_SERVO#<panCh>#<angle>` をライブ送信し、実機ヘッドが左右に動く。指を離した値を中立として保存。
-- **チルト水平スライダ** `calib.tilt`(0〜180、既定 ≈95): ライブ送信で上下確認。キャリブレーション経路は `look()` のクランプを経由せず**生角度で `Dispatcher.servo(index,angle)` を送る**(§4)。
-- **直進補正スライダ** `calib.trim`: 左右モータ差を小さくするための `motorTrim` を調整する。
-- **正面を向くボタン** `calib.center`(`a11y.calib.center`): 保存済み中立値でパン・チルト両方を一括送信し、ヘッドをホームへ。
-- 補足フッター `calib.hint`: 「動作はバッテリ接続時のみ実機が動きます。スライダは離した位置で保存されます」。
+- **Swap toggle** `calib.swap` (`a11y.calib.swap`): inverts which physical channel (0/1) the semantic pan/tilt is sent to. ON for this unit.
+- **Pan-invert toggle** `calib.panInvert`: inverts only the pan axis when left/right and the physical-angle direction feel reversed.
+- **Pan-neutral slider** `calib.pan` (0–180, default 90): dragging it **live-sends** `CMD_SERVO#<panCh>#<angle>` so the real head moves left/right. The value at release is saved as neutral.
+- **Tilt-level slider** `calib.tilt` (0–180, default ≈95): live-sends to check up/down. The calibration path does not go through `look()`'s clamps; it sends the **raw angle via `Dispatcher.servo(index,angle)`** (§4).
+- **Straight-line trim slider** `calib.trim`: adjusts `motorTrim` to reduce the left/right motor imbalance.
+- **Center-head button** `calib.center` (`a11y.calib.center`): sends both pan and tilt at once using the saved neutrals, returning the head home.
+- Footer `calib.hint`: "The real head only moves with the battery connected. The slider saves at the position where you release."
 
-**永続化**: `panNeutral` / `tiltNeutral` / `swapPanTilt` を UserDefaults に保存(§5)。`look()` はこの 3 値を毎回参照。
+**Persistence**: `panNeutral` / `tiltNeutral` / `servoSwap` (plus `panInvert` / `motorTrim`) are saved to UserDefaults (§5). `look()` references these values every time.
 
-**キャリブレーションフロー**:
+**Calibration flow**:
 
 ```mermaid
 flowchart TD
-  A[設定 → サーボ調整] --> B{Dry-run / バッテリー状態を確認}
-  B --> C[入替トグルで pan↔tilt チャンネルを合わせる]
-  C --> D[パン中立スライダー: 正面に見えるまで左右調整<br/>離すと CMD_SERVO 保存]
-  D --> E[チルト水平スライダー: 水平まで上下調整<br/>離すと保存]
-  E --> F[正面を向くボタンで一括確認]
-  F --> G{ヘッドは正面・水平か?}
-  G -- いいえ --> C
-  G -- はい --> H[完了 / メインHUDの telemetry に反映]
+  A[Settings → Servo calibration] --> B{Check dry-run / battery state}
+  C[Match the pan↔tilt channels with the swap toggle]
+  B --> C
+  C --> D[Pan-neutral slider: adjust left/right until forward<br/>release saves via CMD_SERVO]
+  D --> E[Tilt-level slider: adjust up/down to level<br/>release saves]
+  E --> F[Confirm both with the Center-head button]
+  F --> G{Head forward and level?}
+  G -- No --> C
+  G -- Yes --> H[Done / reflected in the main HUD telemetry]
 ```
 
 ---
 
-## 12. インタラクションフロー
+## 12. Interaction Flows
 
-### 12.1 AI の行動を見る・聞く
+### 12.1 Watching and hearing the AI act
 
-ループが `car.image` を OpenAI 視覚モデルへ(`Brain.decide(..., lang:)`)→ 構造化 `Intent`(throttle/steer/pan/tilt/face/observation/taskState)。反映:
+The loop sends `car.image` to the OpenAI vision model (`Brain.decide(..., lang:)`) → a structured `Intent` (throttle/steer/pan/tilt/forward_open/hazard/observation/taskState). Reflected as:
 
-- **見る**: reportCard に `observation`＋`state.*` ラベル。カメラ実映像で行動確認。
-- **聞く**: `observation` を `speech.speak()` が選択言語音声で読み上げ。
-- **首**: `pan/tilt` は `look()`(キャリブレーション補正込み)でヘッドが動く。
-- **顔 LED**: `face` は `CMD_MATRIX_MOD`。
-- `done` でゴール自動クリア。`blocked` は 3 回連続のみ終了。心拍(10Hz)で `intent` をパルス走行に展開(Dry-run 中は送信せずログ/読み上げのみ)。
+- **See**: the reportCard shows `observation` + a `state.*` label. Confirm behavior against the live camera.
+- **Hear**: `speech.speak()` reads the `observation` in the selected-language voice.
+- **Head**: `pan/tilt` move the head via `look()` (with calibration correction).
+- **Body-LED cues**: the car conveys its state through the corner WS2812 "light language" (`LedLanguage` / `updateLeds`) — a steady white "vision light" while scanning, directional forward/turn/reverse cues, a red blink on e-stop, etc. — plus a rainbow + victory jingle on done. (The LED-matrix face command `CMD_MATRIX_MOD` still exists in Dispatcher but is not driven by the live loop.)
+- `done` auto-clears the goal. `blocked` is terminal only after 3 in a row. The 10 Hz heartbeat expands the `intent` into pulse-drive (during dry-run it logs/speaks only, without sending).
 
 ```mermaid
 flowchart LR
-  G[ゴール text/voice] --> L[制御ループ 0.7Hz判断]
-  L --> V[OpenAI視覚 → Intent]
-  V --> R[reportCard 表示]
-  V --> S[TTS 読み上げ]
+  G[Goal text/voice] --> L[Control loop, 0.7Hz decisions]
+  L --> V[OpenAI vision → Intent]
+  V --> R[Show reportCard]
+  V --> S[TTS speak]
   V --> H[look pan/tilt]
-  V --> D[10Hz心拍 → pulse-drive]
-  D -->|Dry-run OFF & 安全OK| M[CMD_MOTOR 送信]
-  D -->|Dry-run ON / 安全NG| X[stop 保持]
+  V --> D[10Hz heartbeat → pulse-drive]
+  D -->|Dry-run OFF & safety OK| M[Send CMD_MOTOR]
+  D -->|Dry-run ON / safety NG| X[Hold / stop]
 ```
 
 ### 12.2 STOP
 
-下端はアイドル時 START、車体が動きうる時 STOP。STOP タップ＝ `emergencyStop()`: `estop=true`・`goal` クリア・即 `CMD_MOTOR#0#0#0`・`status.estop`。`haltMotionState()` により直接テレオペ、衝突脱出、探索、接近ラッチ、古い Vision 判断を失効させる。ホスト側反射(deadman 500ms / vision-stale 800ms / link-down / low-battery / collision escape)が STOP とは別に自動でも停止をかけ、理由を statusPill に出す。
+The bottom button is START when idle and STOP whenever the car might move. Tapping STOP = `emergencyStop()`: `estop=true`, clear `goal`, immediate `CMD_MOTOR#0#0#0`, `status.estop`. `haltMotionState()` invalidates direct teleop, collision escape, search, the approach latch, and stale vision decisions. Host-side reflexes (deadman 500 ms / vision-stale 800 ms / link-down / low-battery / collision escape) also stop the car automatically, independent of STOP, and surface the reason in the statusPill.
 
-### 12.3 サーボをライブ調整
+### 12.3 Live servo calibration
 
-設定→サーボ調整でスライダを動かすと**指の動きに追従して実機ヘッドが動く**(`CMD_SERVO#index#angle` 連続送信)。入替トグルで pan/tilt のチャンネルを一致させ、中立を合わせ、正面ボタンで確認。値は即保存され、以降のメイン運用(`look()`)とメイン telemetry 表示に反映。STT/AI ループとは独立に手早く回せる導線にする。
+In Settings → Servo calibration, moving a slider **moves the real head in step with your finger** (continuous `CMD_SERVO#index#angle` sends). Match the pan/tilt channels with the swap toggle, set the neutrals, and confirm with the center button. Values are saved immediately and reflected in later main operation (`look()`) and the main telemetry. The path is designed to be quick and independent of the STT/AI loop.
 
 ---
 
-## 13. 多言語 EN/JA 設計
+## 13. Bilingual EN/JA Design
 
-- **UI 文言**: すべて `LocalizedStringKey`(`Text("btn.stop")` 等)＋ `en.lproj`/`ja.lproj` の `Localizable.strings`。動的文字列(IP・角度・話者テキスト)以外にハードコードを置かない。書式付きは `NSLocalizedString(...)`＋`String(format:)`(既存 `settings.speedCap` 方式)。
-- **言語解決の単一ソース**: `RobotController.resolvedLang`(Auto は `Locale.current` が ja なら ja、他は en)。これが UI・AI・音声すべての親。
-- **UI ロケール注入**: `.environment(\.locale, ctl.uiLocale)` をルート(`ContentView`)と `ConfigView` 両方に付与し、端末言語に依存させずアプリ内選択で上書き。
-- **言語ピッカー**: 設定の `Picker`(`lang.auto`／verbatim "English"／"日本語")。`lang` の `didSet` が UserDefaults 保存＋ `speech.langCode = voiceCode` を即時反映。
-- **AI 返答**: `Brain.decide(..., lang: resolvedLang)`。日本語選択時はプロンプトで `observation` を自然な日本語で書かせる。reportCard 表示は言語一致。
-- **TTS**: `speech.speak()` が `AVSpeechSynthesisVoice(language: langCode)`(ja-JP/en-US)で読み上げ。
-- **STT**: `SFSpeechRecognizer(locale: langCode)` で口述言語も追従。
+- **UI strings**: everything is a `LocalizedStringKey` (e.g. `Text("btn.stop")`) plus `Localizable.strings` in `en.lproj` / `ja.lproj`. No hard-coding except for dynamic strings (IP, angles, speaker text). Formatted strings use `NSLocalizedString(...)` + `String(format:)` (the existing `settings.speedCap` approach).
+- **Single source of language resolution**: `RobotController.resolvedLang` (with Auto, ja if `Locale.current` is ja, else en). This is the parent of the UI, AI, and voice.
+- **UI locale injection**: `.environment(\.locale, ctl.uiLocale)` is applied to both the root (`ContentView`) and `ConfigView`, overriding the device language with the in-app selection.
+- **Language picker**: the Settings `Picker` (`lang.auto` / verbatim "English" / "日本語"). `lang`'s `didSet` saves to UserDefaults and immediately applies `speech.langCode = voiceCode`.
+- **AI replies**: `Brain.decide(..., lang: resolvedLang)`. When Japanese is selected, the prompt asks for the `observation` in natural Japanese. The reportCard display matches the language.
+- **TTS**: `speech.speak()` reads with `AVSpeechSynthesisVoice(language: langCode)` (ja-JP/en-US).
+- **STT**: `SFSpeechRecognizer(locale: langCode)` follows the dictation language too.
 
-### 13.1 キャリブレーション新規ローカライズキー(両 `.strings` に対で追加)
+### 13.1 New calibration localization keys (add as pairs to both `.strings`)
 
-| キー | en | ja |
+| Key | en | ja |
 |---|---|---|
 | `settings.section.calib` | `Servo calibration` | `サーボ調整` |
 | `calib.swap` | `Swap pan / tilt` | `パン/チルトを入替` |
@@ -507,153 +513,153 @@ flowchart LR
 | `a11y.calib.tilt` | `Tilt level angle` | `チルト水平角` |
 | `a11y.calib.center` | `Center the head` | `ヘッドを正面へ` |
 
-(既存キー `settings.apiKey` / `settings.carIP` のフッター注記キーも同様に追加推奨。)
+(Adding footer-note keys for the existing `settings.apiKey` / `settings.carIP` is likewise recommended.)
 
 ---
 
-## 14. アクセシビリティ
+## 14. Accessibility
 
-- **VoiceOver ラベル**: 既存 `a11y.voice`(マイク)／`a11y.settings`(歯車)を踏襲。追加:
-  - STOP: 明示ラベル `btn.stop`＋`.accessibilityAddTraits(.isButton)`、可能なら「二重確認不要の即時停止」を hint に。
-  - 送信ボタン: `btn.send`、`disabled` 時は VoiceOver でも無効を通知。
-  - 状態ドット: 色だけに依存させず、`cmd`/`cam` ドットへ `.accessibilityLabel` で「接続済み/未接続」を付与。
-  - reportCard: 状態ラベル＋本文を 1 読み上げ単位に `.accessibilityElement(children: .combine)`。TTS と二重にならないよう配慮。
-  - キャリブレーションスライダ: `a11y.calib.pan/tilt` ラベル＋ `.accessibilityValue`(現在角度)＋調整可能トレイト。入替トグル・正面ボタンに各 a11y ラベル。
-- **コントラスト**: 暗い映像上の白文字＋ガラス地。明るいシーンでも各パネルの `.ultraThinMaterial` 背景を必須(テキスト直置き禁止)。副次情報の `opacity` は 0.8 未満に下げない。黄 `DRY`・赤 STOP・緑/赤ドットは形/ラベルと併用し色単独の意味付けを避ける。
-- **タップ域**: 主要操作は 44pt 以上(mic/send 44、STOP 56)。
-- **Dynamic Type**: システムフォント基準で追従。reportCard 等は複数行折返し(`axis: .vertical`)で拡大時も切れない。
-
----
-
-## 15. 現行実装サマリと残る確認
-
-1. **実装済み**: `CMD_SERVO` 2 発のサーボ入替補正、tiltNeutral 95 移行、pan 反転、motorTrim、低電圧停止、`CMD_SONIC`、ファーム 20cm 前進 veto、ホスト衝突脱出、低照度モード、Manual/Remote/START-STOP 状態遷移。
-2. **実装済み**: Remote は thin client として WSS リレーへ接続し、ブリッジ側が脳・安全・車体書き込みを担う。アプリは ~2Hz heartbeat、Remote arm 確認、REMOTE/DRY 表示、ローカル STOP ラッチを持つ。
-3. **残る確認**: リリース前に `QUALITY_ACCEPTANCE.md` の実車ログ欄を埋める。特に低照度、柔らかい/no echo 障害物、後進救済、Remote 切断時 disarm、TTS/演出割り込みは手元環境の実機確認が必要。
-
-`QUALITY_ACCEPTANCE.md` は、設計上の安全・状態遷移・Remote 運用を実装箇所と実機確認へ結びつけるリリース前チェックリストである。
+- **VoiceOver labels**: follow the existing `a11y.voice` (mic) / `a11y.settings` (gear). Additions:
+  - STOP: an explicit `btn.stop` label + `.accessibilityAddTraits(.isButton)`, and ideally a hint noting "immediate stop, no double confirmation."
+  - Send button: `btn.send`; when `disabled`, VoiceOver should announce it as disabled.
+  - Status dots: don't rely on color alone — add `.accessibilityLabel` "connected/disconnected" to the `cmd`/`cam` dots.
+  - reportCard: combine the state label + body into one spoken unit with `.accessibilityElement(children: .combine)`, taking care not to double up with the TTS.
+  - Calibration sliders: `a11y.calib.pan/tilt` labels + `.accessibilityValue` (current angle) + the adjustable trait. Individual a11y labels on the swap toggle and center button.
+- **Contrast**: white text over dark video plus a glass ground. Even in bright scenes, each panel's `.ultraThinMaterial` background is required (no text placed directly on the frame). Don't drop secondary `opacity` below 0.8. The yellow `DRY`, red STOP, and green/red dots are paired with shape/labels so meaning is never conveyed by color alone.
+- **Tap targets**: primary controls are ≥ 44pt (mic/send 44, STOP 56).
+- **Dynamic Type**: follows the system font. The reportCard and similar wrap over multiple lines (`axis: .vertical`) so they don't clip when enlarged.
 
 ---
 
-## 追補 v1.1 (2026-07-24): mDNS/Bonjour 自動発見 設計
+## 15. Current Implementation Summary and Remaining Checks
 
-**ファーム (`AI_Car_Firmware`)**
-- `#include <ESPmDNS.h>`。WiFi STA 接続確立後（`WiFi_Setup(0)` の後）に:
+1. **Implemented**: the two-`CMD_SERVO` servo-swap correction, migration to tiltNeutral 95, pan inversion, motorTrim, low-voltage stop, `CMD_SONIC`, the firmware 20 cm forward veto, host collision escape, low-light mode, and the Manual/Remote/START-STOP state transitions.
+2. **Implemented**: Remote connects as a thin client to the WSS relay, with the bridge side owning the brain, safety, and writes to the car. The app has a ~2 Hz heartbeat, Remote-arm confirmation, REMOTE/DRY indicators, and a local STOP latch.
+3. **Remaining checks**: before release, fill in the real-car log fields in `QUALITY_ACCEPTANCE.md`. In particular, low light, soft/no-echo obstacles, reverse recovery, disarm on Remote disconnect, and TTS/effect interruption need real-hardware verification in the local environment.
+
+`QUALITY_ACCEPTANCE.md` is the pre-release checklist that ties the design's safety, state transitions, and Remote operation to their implementation sites and to real-hardware verification.
+
+---
+
+## Addendum v1.1 (2026-07-24): mDNS/Bonjour auto-discovery design
+
+**Firmware (`AI_Car_Firmware`, a not-included Freenove derivative — described here for reference)**
+- `#include <ESPmDNS.h>`. After the WiFi STA connection is established (after `WiFi_Setup(0)`):
   ```cpp
   if (MDNS.begin("robotbrain")) { MDNS.addService("robotbrain", "tcp", 4000); }
   ```
-- 効果: 車体が `robotbrain.local` で名前解決可能になり、`_robotbrain._tcp`（ポート 4000）を広告。IP が変わってもホスト名は不変。
+- Effect: the chassis becomes resolvable as `robotbrain.local` and advertises `_robotbrain._tcp` (port 4000). The hostname stays fixed even when the IP changes.
 
-**アプリ**
-- 既定 `carIP = "robotbrain.local"`。`NWConnection(host: "robotbrain.local", ...)` は mDNS で解決（ローカルネットワーク権限下）。コマンド :4000／カメラ :7000 とも同一ホストへ接続。
-- `Discovery`（`NWBrowser`, `.bonjour(type:"_robotbrain._tcp")`）で明示探索。発見時に `carIP` を設定し再接続。5 秒でタイムアウト。
-- `ConfigView` の車体セクションに「車を探す」ボタン＋探索状態表示。
-- `project.yml` の Info.plist に `NSBonjourServices = ["_robotbrain._tcp"]` を追加（未宣言だと `NWBrowser` が発見できない）。
+**App**
+- Default `carIP = "robotbrain.local"`. `NWConnection(host: "robotbrain.local", ...)` resolves via mDNS (under the local-network permission). Both the command :4000 and camera :7000 connect to the same host.
+- `Discovery` (`NWBrowser`, `.bonjour(type:"_robotbrain._tcp")`) does explicit discovery. On a find it sets `carIP` and reconnects. It times out at 5 seconds.
+- The Car section of `ConfigView` has a "Find car" button plus discovery-status text.
+- The app's Info.plist declares `NSBonjourServices = ["_robotbrain._tcp"]` (without it, `NWBrowser` cannot discover).
 
-**データフロー**: ファーム広告 → アプリ既定ホスト解決 or 明示ブラウズ → `robotbrain.local` を両ポートに接続。数値 IP は手入力フォールバック。
+**Data flow**: firmware advertises → the app resolves the default host or browses explicitly → connects `robotbrain.local` on both ports. A numeric IP is the manual-entry fallback.
 
 ---
 
-# 第 III 部　融合探索（カメラ×距離センサーのセンサーフュージョン）
+# Part III — Fused Exploration (camera × distance-sensor fusion)
 
-## 16. 空間認識探索 設計書（2026-07-27）
+## 16. Spatial-awareness exploration design (2026-07-27)
 
-> 対応要件: FR-66〜FR-71（REQUIREMENTS.md §5.4.2）。実装対象は LAN(Swift `RobotController`/`Brain`) を主とし、Remote(Python `main.py`/`brain.py`/`bridge_main.py`) に同一挙動を移植（LAN==Remote 不変条件）。
+> Requirements: FR-66–FR-71 (REQUIREMENTS.md §5.4.2). The primary implementation target is LAN (Swift `RobotController`/`Brain`), with the same behavior ported to Remote (Python `main.py`/`brain.py`/`bridge_main.py`) — the LAN==Remote invariant.
 
-### 16.1 動機と背景
-現行の決定論的探索（§3.3 FR-54〜56）は **超音波1本の前方ビームだけ**で relocate 方向を決めており、カメラが撮っている豊富なシーン情報を使っていない。結果、屋内で前方が塞がると**盲目的にその場ピボット**するだけで賢く動けない。一方、VLM 単独の判断も不安定（暗所で幻視、距離が測れない）。→ **カメラ（意味・広視野・柔軟障害物）と超音波（正確な距離・近距離安全）を融合**して探索方向を選ぶ。
+### 16.1 Motivation and background
+The current deterministic search (§3.3, FR-54–56) decides the relocate direction from **only the forward ultrasonic beam**, ignoring the rich scene information the camera captures. As a result, when the path ahead is blocked indoors, it just **pivots blindly in place** instead of moving intelligently. On the other hand, VLM-only decisions are unstable (hallucinations in the dark, no distance). → **Fuse the camera (semantics, wide FOV, soft obstacles) with the ultrasonic (accurate distance, near-field safety)** to choose the exploration direction.
 
-### 16.2 ハードウェア前提（不変の制約）
-- 超音波 HC-SR04 は **カメラと同じ pan/tilt 首に同架**。首を振れば**各 pan 角の距離を測れる**（＝距離ファンを無料で取得できる）。現状これを使っていない（首振り中に sonar を読んでいない）。
-- pan は Servo_2 [0,180] 再フラッシュ済みで**左右両半球**可動。tilt 実水平 ≈ semantic 90（tiltNeutral=95）。
-- **オドメトリ/IMU 無し** → 自己位置・向きを追えない → **永続的な metric マップ(SLAM)は作れない**。
-- カメラは 240×176 の単眼2D、深度なし。
-- 超音波は 1 本の細いビーム、**柔らかい/薄い/斜め/低い物を素通り**（no-echo=300）。
+### 16.2 Hardware premises (invariant constraints)
+- The ultrasonic HC-SR04 is **co-mounted on the same pan/tilt head as the camera**. Sweep the head and you **measure distance at each pan angle** (a distance fan comes for free). This is currently unused (the sonar isn't read during the sweep).
+- Pan is reflashed to Servo_2 [0,180] so **both left/right hemispheres** are reachable. Physical level tilt ≈ semantic 90 (tiltNeutral=95).
+- **No odometry / IMU** → position and heading cannot be tracked → **no persistent metric map (SLAM)**.
+- The camera is a 240×176 monocular 2D image, no depth.
+- The ultrasonic is a single narrow beam that **passes straight through soft/thin/angled/low objects** (no-echo=300).
 
-### 16.3 データモデル（すべて一時メモリ、非永続）
-永続保存はしない。**現在地点のローカル・スナップショットのみ** RAM に保持し、relocate したら破棄。
+### 16.3 Data model (all transient, non-persistent)
+Nothing is persisted. Only a **local snapshot of the current spot** is held in RAM, discarded on relocate.
 ```
-struct DirSample {            // 1 つの走査方向
-  semanticPan: Int            // 首の pan（90=正面, <90 右 / >90 左 はキャリブ依存）
-  sonarCm: Double?            // その向きの超音波距離（nil=未取得, 300=no-echo/遠い）
-  vlmOpen: Double             // VLM が見た「開放度」 0..1（0=塞がり,1=開けた床/通路）
-  vlmNote: String             // 任意の所見（"doorway" 等, デバッグ/anti-loop 用）
+struct DirSample {            // one scanned direction
+  semanticPan: Int            // head pan (90=forward, <90 right / >90 left is calibration-dependent)
+  sonarCm: Double?            // ultrasonic distance for that heading (nil=not read, 300=no-echo/far)
+  vlmOpen: Double             // openness the VLM sees, 0..1 (0=blocked, 1=open floor/hallway)
+  vlmNote: String             // optional observation ("doorway", etc.; debug / anti-loop)
 }
-var spotFan: [DirSample]      // 今の地点の走査結果（scan で埋め、relocate で使い捨て）
+var spotFan: [DirSample]      // this spot's scan result (filled in scan, consumed in relocate)
 ```
-- `spotFan` は `RobotController`（LAN）/ brain 状態（Remote）に持つ。地点を離れたらクリア。
-- 既存の `memory`（テキスト所見, anti-loop）は継続。座標なしの「来た道メモ」として併用。
+- `spotFan` lives on `RobotController` (LAN) / the brain state (Remote). Cleared when leaving the spot.
+- The existing `memory` (text observations, anti-loop) continues, used alongside as a coordinate-free "where I've been" note.
 
-### 16.4 制御フロー（applySearch を融合版へ）
-探索は 2 相の状態機械（§3.3 を拡張）:
+### 16.4 Control flow (fuse `applySearch`)
+The search is a two-phase state machine (extending §3.3):
 
-**(A) SCAN_FUSE — その場で距離ファン＋意味を集める**
-- 首を `scanArc` の各 pan 角へ順に向ける（既存）。**各角で頭が settle したら sonar を読む**（`Get_Sonar` 相当）→ `spotFan[i].sonarCm`。
-  - 実装注意: sonar poll の `headForward` ゲートは「正面のみ」だが、SCAN では**各 pan 角で首が settle していれば読む**よう拡張（poll 条件に「scan で settle 済み」を追加）。読んだ距離はその pan 角に帰属させる。
-- 各フレームで VLM に**その向きの開放度 `vlmOpen`（0..1）**と goal 視認を判定させる（§16.6 プロンプト）。
-- goal 視認（approaching/done）を返したら即 §3.3 の approach へ明け渡し（暗所ガードは維持）。
-- アークを一巡したら **(B) RELOCATE_FUSE** へ。
+**(A) SCAN_FUSE — gather the distance fan + semantics in place**
+- Aim the head to each pan angle of `scanArc` in turn (existing). **Once the head settles at each angle, read the sonar** (`Get_Sonar` equivalent) → `spotFan[i].sonarCm`.
+  - Implementation note: the sonar-poll `headForward` gate is "forward only," but for SCAN it is widened to **read whenever the head has settled at each pan angle** (adding "settled during scan" to the poll condition). The reading is attributed to that pan angle.
+- For each frame, have the VLM judge **that heading's openness `vlmOpen` (0..1)** and whether the goal is visible (§16.6 prompt).
+- If it returns goal-visible (approaching/done), immediately hand off to the §3.3 approach (the low-light guard stays on).
+- Once the arc is fully covered, go to **(B) RELOCATE_FUSE**.
 
-**(B) RELOCATE_FUSE — 融合スコアで最良方向へ移動**
-1. 各 `DirSample` に**融合スコア**を付ける:
+**(B) RELOCATE_FUSE — move toward the best direction by a fused score**
+1. Give each `DirSample` a **fused score**:
    ```
    score(d) = w_sonar * norm(d.sonarCm) * gate_soft(d) + w_vlm * d.vlmOpen
-   norm(cm)   = clamp(cm/DIST_NORM_CM(150), 0, 1)   // 遠いほど高い
-   gate_soft  = d.vlmOpen < OPEN_MIN(0.3) ? 0.2 : 1  // カメラが「塞がり」なら sonar が空きでも減点（柔軟障害物）
-   w_sonar=0.6, w_vlm=0.4（要チューニング）
+   norm(cm)   = clamp(cm/DIST_NORM_CM(150), 0, 1)   // farther = higher
+   gate_soft  = d.vlmOpen < OPEN_MIN(0.3) ? 0.2 : 1  // if the camera says "blocked," penalize even if the sonar is clear (soft obstacles)
+   w_sonar=0.6, w_vlm=0.4 (to be tuned)
    ```
-2. **相互チェック（フュージョンの肝）**:
-   - sonar 近い（<FWD_BLOCK_CM 30）→ その方向は除外（実障害物）。
-   - sonar は clear だが VLM open 低い（カーテン等）→ `gate_soft` で減点。
-   - VLM open 高いが sonar 近い → sonar 優先で除外。
-3. 最良スコアの方向を選ぶ:
-   - その pan が正面近く（|pan-90|≤PAN_TOL）→ そのまま **前進パルス**。
-   - 横 → **body を pivot して正面へ入れてから前進**（pivot 量は pan 差から算出）。
-4. 前進は短パルス（throttle 0.45 / lowLight 0.30, 350/250ms）。移動後 `spotFan` クリア → (A) へ。
-5. **全方向が閉/低スコア**（どこも行けない）→ 段階的縮退: (i) 最も遠い方向へ pivot して 1 歩、(ii) それでも N 周ダメなら `blocked` を検討（FR-25, ただし数回連続のみ）。
+2. **Cross-check (the heart of fusion)**:
+   - sonar close (< FWD_BLOCK_CM 30) → exclude that direction (a real obstacle).
+   - sonar clear but VLM open low (a curtain, etc.) → penalize via `gate_soft`.
+   - VLM open high but sonar close → sonar wins, exclude.
+3. Choose the best-scoring direction:
+   - if its pan is near forward (|pan-90| ≤ PAN_TOL) → **drive forward** as-is.
+   - if lateral → **pivot the body to bring it forward, then drive** (pivot amount from the pan difference).
+4. The forward move is a short pulse (throttle 0.45 / lowLight 0.30, 350/250 ms). After moving, clear `spotFan` → back to (A).
+5. **All directions closed / low-score** (nowhere to go) → graceful degrade: (i) pivot toward the farthest direction and take one step, (ii) if that fails for N cycles, consider `blocked` (FR-25, but only after several in a row).
 
-### 16.5 安全従属（不変）
-- 融合はあくまで `Intent` を作るだけ。最終 motor 行は §3.1 アービタが決定 → **E-STOP / dry-run / deadman / 低電圧 / collisionEscape / firmware<20cm veto がすべて上位**。
-- RELOCATE の前進は firmware veto(20cm)＋host collisionEscape(25cm) に守られる。融合スコアの除外閾値 `FWD_BLOCK_CM(30)` をそれらより大きく取り、通常は融合側で先に避ける。
-- **暗所ガード（v1.1.38）維持**: lowLight では goal 視認/done を信用しない。加えて lowLight では `vlmOpen` の信頼度を下げ（`w_vlm` を縮小 or 0）、sonar 主体＋クリープ＋ヘッドライトへフォールバック。
+### 16.5 Safety subordination (invariant)
+- Fusion only builds an `Intent`. The final motor line is decided by the §3.1 arbiter → **E-STOP / dry-run / deadman / low-voltage / collisionEscape / firmware <20 cm veto all sit above it.**
+- A RELOCATE forward move is protected by the firmware veto (20 cm) + the host collisionEscape (25 cm). The fusion exclusion threshold `FWD_BLOCK_CM(30)` is set larger than those, so fusion normally avoids first.
+- **The low-light guard is retained**: in low light, do not trust goal-visible/done. Additionally, in low light lower the confidence of `vlmOpen` (shrink `w_vlm` toward 0), falling back to sonar-led + creep + headlight.
 
-### 16.6 VLM 出力の追加（Brain）
-JSON スキーマに探索用フィールドを追加（approach 時は従来通り throttle/steer/pan/tilt を使う）:
+### 16.6 Added VLM output (Brain)
+Add exploration fields to the JSON schema (throttle/steer/pan/tilt are still used during approach):
 ```json
 { "task_state":"searching|approaching|done|blocked",
   "observation":"...",
-  "forward_open": 0.0..1.0,     // ★追加: 今首が向いている方向の開放度（0=塞がり,1=開けた床/通路/戸口）
-  "hazard": "none|soft|ledge|wall",  // ★追加: 超音波が見落とす種類（curtain/段差/壁）
-  ...従来の pan/tilt/throttle/steer は approach 用 }
+  "forward_open": 0.0..1.0,     // ★added: openness of the direction the head currently faces (0=blocked, 1=open floor/hallway/doorway)
+  "hazard": "none|soft|ledge|wall",  // ★added: the kinds the ultrasonic misses (curtain/drop-off/wall)
+  ...existing pan/tilt/throttle/steer are for approach }
 ```
-- プロンプト方針: 「探索中(searching)は**その向きの開放度 forward_open と hazard を毎フレーム報告**。開けた床/通路/戸口=高、壁/家具/散らかり/段差=低。ホストが距離センサーと合わせて進む方向を決める。goal が見えたら approaching。」
-- ユーザーが v1.1.37 で削った「throttle 前方安全信号」は、この `forward_open`（0..1 の連続値）に置き換え・強化する形。
+- Prompt policy: "While searching, **report forward_open and hazard for that heading every frame**. Open floor/hallway/doorway = high; wall/furniture/clutter/drop-off = low. The host decides where to go by combining this with the distance sensor. Set approaching when the goal is visible."
+- This replaces and strengthens the earlier "forward-safety throttle signal" with a continuous `forward_open` (0..1) value.
 
-### 16.7 定数（初期値・すべて要実車チューニング）
+### 16.7 Constants (initial values; all to be tuned on the real car)
 ```
-DIST_NORM_CM = 150     // これ以上遠ければ距離スコア満点
-OPEN_MIN     = 0.3     // VLM 開放度がこれ未満 = カメラが塞がり判定
-FWD_BLOCK_CM = 30      // これ未満は実障害物として方向除外（>escapeEngage25>veto20）
-W_SONAR=0.6  W_VLM=0.4 // 融合重み（lowLight は W_VLM→0 付近へ）
-SCAN 各角の sonar settle 待ち = servoSettleMs(400) 準拠
+DIST_NORM_CM = 150     // farther than this = full distance score
+OPEN_MIN     = 0.3     // VLM openness below this = the camera calls it blocked
+FWD_BLOCK_CM = 30      // closer than this = a real obstacle, exclude the direction (>escapeEngage25>veto20)
+W_SONAR=0.6  W_VLM=0.4 // fusion weights (in low light, W_VLM → near 0)
+SCAN per-angle sonar settle wait = per servoSettleMs(400)
 ```
 
-### 16.8 LAN / Remote パリティ
-- LAN: `RobotController.applySearch` を SCAN_FUSE / RELOCATE_FUSE に拡張。sonar は `CarLink` を各 scan 角で読む。`Brain` の JSON に forward_open/hazard を追加しパース。
-- Remote: `host_brain/main.py`(または brain 部)＋`bridge_main.py` に同一ロジック。`car_link.sonar()` を scan 角で読む。`brain.py` プロンプト同期。
-- 共通述語は `safety.py`（Python）/ `RobotController` 定数（Swift）に定義し、両者で同じ閾値。
+### 16.8 LAN / Remote parity
+- LAN: extend `RobotController.applySearch` to SCAN_FUSE / RELOCATE_FUSE. Read the sonar via `CarLink` at each scan angle. Add forward_open/hazard to `Brain`'s JSON and parse them.
+- Remote: the same logic in `host_brain/main.py` (or the brain part) + `bridge_main.py`. Read `car_link.sonar()` at each scan angle. Keep the `brain.py` prompt in sync.
+- Define the shared predicates in `safety.py` (Python) / `RobotController` constants (Swift), with identical thresholds on both sides.
 
-### 16.9 受け入れ基準（実車で確認）
-1. 前方が塞がった地点で、**開けた方向（左/右）を選んで body を向け→前進**する（盲目ピボットにならない）。
-2. カーテン等の柔軟障害物: sonar が no-echo でも VLM hazard=soft で**突っ込まず回避**。
-3. sonar が近距離を返す実障害物: VLM open が高くても**除外して別方向**へ。
-4. 暗所: 偽の approaching/done を出さず、sonar 主体＋ヘッドライトでクリープ。全方向不明なら安全に縮退。
-5. E-STOP/dry-run/低電圧/衝突脱出がすべて融合より優先で機能。
-6. LAN と Remote で同一挙動。
+### 16.9 Acceptance criteria (verify on the real car)
+1. At a spot blocked ahead, it **picks an open direction (left/right), turns the body, and drives** (no blind pivot).
+2. Soft obstacles like a curtain: even with a sonar no-echo, VLM hazard=soft makes it **avoid rather than charge in**.
+3. A real obstacle where the sonar returns a near distance: even with high VLM open, it **excludes that direction** and goes elsewhere.
+4. Darkness: no false approaching/done; sonar-led + headlight creep. If all directions are unknown, degrade safely.
+5. E-STOP / dry-run / low-voltage / collision escape all function above fusion.
+6. Identical behavior on LAN and Remote.
 
-### 16.10 実装スコープ（チーム分担の目安）
-- P1: `Brain` JSON 拡張（forward_open/hazard）＋プロンプト（Swift/Python）。
-- P2: SCAN_FUSE（各 scan 角で sonar 読取→`spotFan` 構築）。poll 条件拡張。
-- P3: RELOCATE_FUSE（融合スコア＋相互チェック＋方向選択＋pivot→drive）。
-- P4: 縮退/暗所フォールバック、安全従属の確認。
-- P5: 敵対レビュー（要件 FR-66〜71 照合、回帰なし）→ build/install。
+### 16.10 Implementation scope (a rough team split)
+- P1: `Brain` JSON extension (forward_open/hazard) + prompt (Swift/Python).
+- P2: SCAN_FUSE (read sonar at each scan angle → build `spotFan`). Widen the poll condition.
+- P3: RELOCATE_FUSE (fused score + cross-check + direction choice + pivot→drive).
+- P4: degrade / low-light fallback, and verify safety subordination.
+- P5: adversarial review (check against FR-66–71, no regressions) → build/install.

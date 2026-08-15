@@ -1,331 +1,333 @@
-# RobotBrain 要件定義書
+# RobotBrain Requirements Specification
 
-- 文書バージョン: 1.1（品質受入条件追補）
-- 対象アプリ: RobotBrain（iOS ネイティブ / SwiftUI）
-- バンドル ID: `com.example.robotbrainai`
-- 作成日: 2026-07-24
-- 位置づけ: 本書は要件を規定する。文中の「〜すること（shall）」は実装対象の要求であり、現状コードと差がある場合は「付録 A」に明示する。コードトークン（`CMD_MOTOR` 等）およびクラス名（`RobotController` 等）は原文のまま表記する。
-
----
-
-## 1. 目的とスコープ
-
-### 1.1 目的
-RobotBrain は、Freenove 4WD ESP32 車体（FNK0053, ESP32-WROVER）を **iPhone 単体から操作する AI ローバー用コントローラアプリ**である。ユーザーが自然言語で目標（ゴール）を **テキストまたは音声**で与えると、OpenAI の Vision モデルがカメラ 1 フレームを見て次の行動を計画し、アプリがそれを車体コマンドに落として送信する。「見る → 判断する → 少し動かす → また見る」の熟慮的ループを、レイテンシを許容する前提で回す。
-
-### 1.2 スコープサマリ
-- **対象**: RobotBrain iOS アプリ（SwiftUI, iPhone 縦向き）のソフトウェア要件。
-- **中核機能**: 車体への TCP 二重接続（コマンド／カメラ）、ライブ映像表示、テキスト／音声によるゴール入力、OpenAI Vision による熟慮的自律ループ、意味コマンド → `CMD_*` 変換、LED マトリクス表情等の HRI 出力、アプリ内サーボキャリブレーション、常時可視の緊急停止、既定 ON のドライラン、ホスト側安全リフレックス、EN/JA 二言語対応。
-- **前提運用**: 屋内・平坦・低速・監視付き。iPhone と車体が同一 LAN（家庭内 Wi-Fi 2.4 GHz, STA モード）に接続。単一所有者の個人利用。
-- **中心的課題**: (a) レイテンシを許容する視覚駆動の自律、(b) HC-SR04 前方距離センサを併用しつつ低い/柔らかい/斜め/無反射の障害物には限界があることを前提にした安全設計、(c) 本個体で pan/tilt サーボがスワップしている点をアプリ内キャリブレーションで吸収すること。
-- **対象外の要点**: 車体ファームウェア実装、オンデバイス ML/SLAM、距離センサ依存の高速回避、SoftAP でのクラウド運用、複数ユーザー／一般配布、iPad／横向き（詳細は §8）。
-
-### 1.3 システム構成（役割分担）
-本システムは 3 層で構成され、RobotBrain は中間の**ブローカー（頭脳のホスト）層**をランタイムで単独に担う（実行時に Mac を必要としない）。
-
-- **反射層（車体 / ESP32）**: モーター・サーボ PWM、JPEG キャプチャ、TCP コマンドサーバ、オンデバイスのデッドマン停止・切断時 stop-and-hold。ML 推論は一切行わない。
-- **ブローカー層（RobotBrain / iPhone）**: 車体への TCP 接続保持、カメラ受信・表示、Vision モデル呼び出し、意味コマンド → `CMD_*` 文字列への変換とクランプ、ホスト側リフレックス（安全監視）。
-- **皮質層（OpenAI Vision モデル / クラウド）**: フレームを見て構造化された行動意図（`Intent`）を返す。
-
-### 1.4 スコープの範囲
-本書は RobotBrain iOS アプリのソフトウェア要件のみを対象とする。車体ファームウェア（`AI_Car_Firmware`）の実装は対象外だが、アプリが依存する外部インタフェース制約として参照する（§7.1）。
+- Document version: 1.1 (quality-acceptance addendum)
+- Target app: RobotBrain (iOS native / SwiftUI)
+- Bundle ID: `com.example.robotbrainai`
+- Created: 2026-07-24
+- Positioning: This document specifies the requirements. A "shall" statement in the text is a requirement on the implementation; wherever the current code differs, the gap is called out explicitly in Appendix A. Code tokens (`CMD_MOTOR`, etc.) and class names (`RobotController`, etc.) are written verbatim.
 
 ---
 
-## 2. 対象ユーザーと利用文脈
+## 1. Purpose and Scope
 
-### 2.1 対象ユーザー
-- 単一の所有者（個人利用）。日本語・英語のいずれかを主言語とする。
-- 開発・組み立て者本人であり、車体の IP や OpenAI API キーを自分で設定できるだけの技術リテラシーを持つ。
-- 一般配布・複数ユーザー運用は想定しない。
+### 1.1 Purpose
+RobotBrain is a controller app for an AI rover that operates the Freenove 4WD ESP32 chassis (FNK0053, ESP32-WROVER) **from an iPhone alone**. When the user gives a goal in natural language — **by text or by voice** — an OpenAI vision model looks at one camera frame and plans the next action, and the app lowers that action into chassis commands and sends them. It runs the deliberative "look → decide → move a little → look again" loop on the premise that latency is acceptable.
 
-### 2.2 利用文脈
-- **屋内・低速・監視付き**運用。段差・階段のない平坦な床。
-- iPhone と車体は**同一の家庭内 Wi-Fi（2.4 GHz）**に接続し、車体は STA モードで家庭内ルータに参加する。SoftAP（`Sunshine`）はクラウドへ到達できないため運用対象外。
-- ユーザーは片手で iPhone を持ち、ライブ映像を見ながら操作する（縦向き固定）。
-- モーター駆動はバッテリー（18650×2）搭載時のみ。USB 給電時は映像・カメラ・顔表示・通信の検証は可能だが車輪・サーボ・ボディ LED は動かない。
+### 1.2 Scope summary
+- **Target**: the software requirements of the RobotBrain iOS app (SwiftUI, iPhone portrait).
+- **Core functions**: dual TCP connection to the chassis (command / camera), live video display, text/voice goal entry, the deliberative autonomous loop via OpenAI Vision, semantic-command → `CMD_*` translation, HRI output such as LED cues, in-app servo calibration, an always-visible emergency stop, a default-ON dry-run, host-side safety reflexes, and EN/JA bilingual support. Two transports are supported as **equals**: **LAN** (direct TCP to the car) and **Remote** (WSS via the Cloud Run relay and the home bridge). The normative specification for Remote operation is `REMOTE.md`.
+- **Operating premise**: indoor, flat, low-speed, supervised. In **LAN** mode the iPhone and the chassis are on the same home Wi-Fi (2.4 GHz, STA mode); in **Remote** mode the phone reaches the car through the relay + home bridge from anywhere with internet access (see `REMOTE.md`). Single-owner personal use.
+- **Central challenges**: (a) latency-tolerant vision-driven autonomy, (b) safety design that uses the HC-SR04 forward distance sensor while assuming it is limited against low / soft / angled / non-reflective obstacles, (c) absorbing — via in-app calibration — the fact that on this individual unit the pan/tilt servos are swapped.
+- **Out-of-scope highlights**: chassis firmware implementation, on-device ML/SLAM, distance-sensor-dependent high-speed avoidance, cloud operation over SoftAP, multi-user / general distribution, iPad / landscape (details in §8).
+
+### 1.3 System configuration (division of roles)
+The system is organized in three layers. RobotBrain owns the middle **broker (brain-host) layer** at runtime and requires no Mac to run. In LAN mode the broker runs on the phone; in Remote mode the home bridge holds the broker role and the phone acts as a thin operator client (the normative Remote spec is `REMOTE.md`).
+
+- **Reflex layer (chassis / ESP32)**: motor and servo PWM, JPEG capture, the TCP command server, on-device deadman stop and stop-and-hold on disconnect. It runs no ML inference.
+- **Broker layer (RobotBrain / iPhone — or the home bridge in Remote mode)**: holds the TCP connection to the chassis, receives and displays the camera, calls the vision model, translates and clamps semantic commands into `CMD_*` strings, and runs the host-side reflexes (safety monitor).
+- **Cortex layer (OpenAI vision model / cloud)**: looks at the frame and returns a structured action intent (`Intent`).
+
+### 1.4 Scope boundary
+This document covers only the software requirements of the RobotBrain iOS app. The chassis firmware implementation is out of scope but is referenced as an external interface constraint the app depends on (§7.1). The firmware is a not-included Freenove derivative; it is described here descriptively only, and its source is not part of this repository.
 
 ---
 
-## 3. 用語定義
+## 2. Target Users and Usage Context
 
-| 用語 | 意味 |
+### 2.1 Target users
+- A single owner (personal use), whose primary language is either Japanese or English.
+- The builder/assembler themselves, with enough technical literacy to configure the chassis IP and the OpenAI API key.
+- General distribution / multi-user operation is not assumed.
+
+### 2.2 Usage context
+- **Indoor, low-speed, supervised** operation. A flat floor with no steps or stairs.
+- In **LAN** mode the iPhone and the chassis are on the **same home Wi-Fi (2.4 GHz)**, with the chassis joining the home router in STA mode. In **Remote** mode the phone reaches the car through the Cloud Run relay + home bridge, so the phone need not be on the car's LAN (the normative Remote spec is `REMOTE.md`). SoftAP (`Sunshine`) cannot reach the cloud and is not used for operation.
+- The user holds the iPhone in one hand and drives while watching the live video (portrait-locked).
+- Motor drive works only with the battery installed (2× 18650). On USB power, video / camera / face display / comms can be verified, but the wheels, servos, and body LEDs do not move.
+
+---
+
+## 3. Glossary
+
+| Term | Meaning |
 |---|---|
-| ゴール（goal） | ユーザーが与える自然言語の目標。テキストまたは音声で入力。 |
-| 意図（`Intent`） | Vision モデルが返す構造化された次アクション（throttle/steer/duration/pan/tilt/face/observation/task_state）。 |
-| 決定ティック | Vision モデルを呼ぶ周期的タイミング（`decisionHz` = 0.7 Hz）。 |
-| ハートビート | 車体へコマンドを出す高頻度周期（`heartbeatHz` = 10 Hz）。 |
-| パルス駆動 | 自己失効する短時間の駆動指示（`duration_ms` 経過後に自動停止扱いになる）。 |
-| ドライラン（dry-run） | 計画・発話・ログは行うがモーター駆動コマンドを一切送らない安全モード。 |
-| ホスト側リフレックス | アプリ内の安全監視（linkDown / visionStale / deadman / lowBattery）。 |
+| Goal | The natural-language objective the user gives, entered by text or voice. |
+| Intent (`Intent`) | The structured next action the vision model returns (throttle/steer/duration/pan/tilt/face/observation/task_state). |
+| Decision tick | The periodic moment the vision model is called (`decisionHz` = 0.7 Hz). |
+| Heartbeat | The high-frequency cycle that emits commands to the chassis (`heartbeatHz` = 10 Hz). |
+| Pulse drive | A short, self-expiring drive instruction (treated as auto-stopped once `duration_ms` elapses). |
+| Dry-run | A safe mode that plans, speaks, and logs but sends no motor-drive command. |
+| Host-side reflex | The in-app safety monitor (linkDown / visionStale / deadman / lowBattery). |
 
 ---
 
-## 4. 要件サマリ表
+## 4. Requirements Summary Tables
 
-### 4.1 機能要件（FR）サマリ
+### 4.1 Functional requirements (FR) summary
 
-| 分類 | 要件 ID | 概要 |
+| Category | Requirement IDs | Overview |
 |---|---|---|
-| 接続・通信（Wi-Fi/TCP） | FR-1〜FR-7 | コマンド(4000)／カメラ(7000)の TCP 二重接続保持、`#` 区切り＋`\n`送信、約1秒間隔の自動再接続、接続状態インジケータ、IP 編集・永続化、JPEG フレーム受信、起動/停止シーケンス |
-| ライブカメラ表示 | FR-8〜FR-12 | 全画面 JPEG 表示、映像なしプレースホルダ、3×3 参照グリッド、テレメトリ帯、フレーム受信時刻の保持 |
-| ゴール入力（テキスト＆音声） | FR-13〜FR-17 | テキスト送信（空文字不可）、STT 開始/停止と逐次表示、ロケール追従、権限要求、ゴール確定処理 |
-| AI Vision 自律ループ | FR-18〜FR-27 | 約0.7Hz の Vision 呼び出し、入力構成、`Intent` 解釈と安全フォールバック、意味→`CMD_*`集中変換、自己失効パルス、pan/tilt・表情送出、所見/状態表示・TTS、done/blocked 処理、メモリ、差動駆動変換 |
-| 表情・ボディ表現（HRI） | FR-28〜FR-29 | LED マトリクス表情、ボディ LED／ブザー送出インタフェース |
-| サーボキャリブレーション | FR-30〜FR-34 | pan/tilt スワップトグル、中立オフセット・リアルタイム確認、設定永続化、`look()` の実軸解決、tilt 実可動マッピング |
-| 緊急停止 | FR-35〜FR-37 | 常時可視 STOP、AI 非依存の即時停止、ドライラン/状態非依存、設定「すべて停止」 |
-| ドライラン（安全既定） | FR-38〜FR-40 | 駆動非送出、既定 ON・毎起動 ON、DRY バッジ表示 |
-| ホスト側安全リフレックス | FR-41〜FR-43 | linkDown/visionStale/deadman/lowBattery による停止、`CMD_POWER` 監視、状態の HUD 反映 |
-| 設定 | FR-44〜FR-47 | 各項目編集、速度上限範囲、API キー伏字、永続化ポリシー |
-| 二言語対応（EN/JA） | FR-48〜FR-50 | 全 UI ローカライズ、言語ピッカー、AI/TTS/STT の言語追従 |
-| 品質受入条件 | FR-57〜FR-65 | STOP 状態リセット、直接移動コマンド、衝突脱出、低照度制限、完了演出、トレース管理 |
+| Connectivity / comms (Wi-Fi/TCP) | FR-1–FR-7 | Hold dual TCP connections — command (4000) / camera (7000); `#`-delimited + `\n` send; auto-reconnect at ~1 s intervals; connection-state indicators; IP editing + persistence; JPEG frame receive; start/stop sequences |
+| Live camera display | FR-8–FR-12 | Full-screen JPEG display, no-video placeholder, 3×3 reference grid, telemetry strip, retention of the frame-receive timestamp |
+| Goal entry (text & voice) | FR-13–FR-17 | Text send (no empty string), STT start/stop with incremental display, locale following, permission requests, goal-commit handling |
+| AI Vision autonomous loop | FR-18–FR-27 | ~0.7 Hz Vision calls, input composition, `Intent` interpretation with safe fallback, semantic → `CMD_*` central translation, self-expiring pulses, pan/tilt head aim, observation/state display + TTS, done/blocked handling, memory, differential-drive conversion |
+| Expression / body output (HRI) | FR-28–FR-29 | LED-matrix face interface, body-LED / buzzer send interface |
+| Servo calibration | FR-30–FR-34 | pan/tilt swap toggle, neutral offsets + real-time confirmation, settings persistence, real-axis resolution in `look()`, tilt real-travel mapping |
+| Emergency stop | FR-35–FR-37 | Always-visible STOP, AI-independent immediate stop, dry-run/state-independent, settings "stop all" |
+| Dry-run (safe default) | FR-38–FR-40 | No drive send, default ON + ON every launch, DRY badge |
+| Host-side safety reflexes | FR-41–FR-43 | Stop on linkDown/visionStale/deadman/lowBattery, `CMD_POWER` monitoring, state reflected in the HUD |
+| Settings | FR-44–FR-47 | Per-item editing, speed-cap range, API-key masking, persistence policy |
+| Bilingual support (EN/JA) | FR-48–FR-50 | Full UI localization, language picker, AI/TTS/STT language following |
+| Quality acceptance criteria | FR-57–FR-65 | STOP state reset, direct movement commands, collision escape, low-light limits, completion celebration, trace management |
 
-### 4.2 非機能要件（NFR）サマリ
+### 4.2 Non-functional requirements (NFR) summary
 
-| 分類 | 要件 ID | 概要 |
+| Category | Requirement IDs | Overview |
 |---|---|---|
-| レイテンシと性能 | NFR-1〜NFR-4 | 0.5〜2秒/ティック許容、10Hz ハートビート、HQVGA 10〜15fps、低解像度 Vision 呼び出し |
-| 安全性 | NFR-5〜NFR-8 | 停止のアプリ内完結、既定モーション不可、二重クランプ、監視付き前提の UI |
-| API キー・セキュリティ | NFR-9〜NFR-11 | ハードコード禁止、`UserDefaults`保存（非暗号化・リスク明示）、キー/個人情報のログ・URL 非出力 |
-| ネットワーク/DHCP | NFR-12〜NFR-13 | IP 変動前提・再接続・状態可視化、同一 LAN 共有・ローカルネットワーク権限 |
-| プラットフォーム/ビルド | NFR-14〜NFR-16 | SwiftUI 縦向き、iOS 17.0 ターゲット/Xcode 26・XcodeGen、実行時 Mac 不要 |
-| アクセシビリティ | NFR-17〜NFR-18 | VoiceOver ラベル、Dynamic Type・十分なコントラスト |
-| ローカライゼーション | NFR-19〜NFR-20 | EN/JA 2言語一貫、新規文字列は両言語追加・ハードコード禁止 |
-| 信頼性・堅牢性 | NFR-21〜NFR-22 | 障害時の非クラッシュ・安全側フォールバック、patched firmware 依存の接続保持設計 |
-| 視覚デザイン（Liquid Glass） | NFR-23〜NFR-24 | 全画面映像＋フロスト HUD・ダーク基調、ロボットレンダーのアプリアイコン |
+| Latency and performance | NFR-1–NFR-4 | 0.5–2 s/tick tolerated, 10 Hz heartbeat, HQVGA 10–15 fps, low-resolution Vision calls |
+| Safety | NFR-5–NFR-8 | Stop is fully in-app, no default motion, double clamping, supervised-premise UI |
+| API key / security | NFR-9–NFR-11 | No hardcoding, `UserDefaults` storage (unencrypted, risk stated), no key/PII in logs or URLs |
+| Network / DHCP | NFR-12–NFR-13 | IP-drift premise + reconnect + state visibility, shared LAN + local-network permission |
+| Platform / build | NFR-14–NFR-16 | SwiftUI portrait, iOS 17.0 target / Xcode 26 · XcodeGen, no Mac at runtime |
+| Accessibility | NFR-17–NFR-18 | VoiceOver labels, Dynamic Type · adequate contrast |
+| Localization | NFR-19–NFR-20 | Consistent EN/JA, new strings added in both languages · no hardcoding |
+| Reliability / robustness | NFR-21–NFR-22 | No crash on failure · fail-safe fallback, connection-holding design against the patched firmware |
+| Visual design (Liquid Glass) | NFR-23–NFR-24 | Full-screen video + frosted HUD · dark base, robot-render app icon |
 
 ---
 
-## 5. 機能要件（FR）
+## 5. Functional Requirements (FR)
 
-### 5.1 接続・通信（Wi-Fi / TCP）
+### 5.1 Connectivity / Comms (Wi-Fi / TCP)
 
-- **FR-1**: アプリは車体の IPv4 アドレス（DHCP で変動しうる）に対し、コマンド用 TCP 接続（ポート `4000`）とカメラ用 TCP 接続（ポート `7000`）の 2 本を、`CarLink` を通じて確立・保持すること。
-- **FR-2**: コマンド送信は `#` 区切りフィールドの ASCII テキスト 1 行に、末尾へ改行（`\n`）を付与して行うこと（改行付与は `CarLink` の責務）。通常コマンドは fire-and-forget とし、`CMD_POWER` と `CMD_SONIC` は応答行を返す。
-- **FR-3**: いずれかの接続が `failed` になった場合、ユーザー操作なしに約 1 秒間隔で自動再接続を試みること。明示的 `cancelled`（アプリ主導の切断）では再接続しないこと。
-- **FR-4**: コマンド接続・カメラ接続それぞれの接続状態（`cmdConnected` / `camConnected`）を UI に常時インジケータ（緑=接続 / 赤=未接続）として表示すること（HUD の "cmd" / "cam" ドット）。
-- **FR-5**: 車体 IP はユーザーが設定画面で編集でき、変更後は再接続操作（`btn.reconnect`）で反映できること。IP は永続化すること（`UserDefaults` キー `carIP`）。
-- **FR-6**: カメラストリームは「4 バイトのリトルエンディアン長プレフィックス + その長さ分の JPEG バイト列」というフレーム形式で受信すること。長さが 0 以下または 4,000,000 バイト以上の場合は不正フレームとして破棄すること。
-- **FR-7**: アプリ起動時（`ctl.start()`）にコマンド接続・カメラ接続を開き、`CMD_VIDEO#1` を送出して映像ストリームを開始すること。停止時（`stopAll()`）は停止コマンドと `CMD_VIDEO#0` を送り、両接続を閉じること。
+- **FR-1**: The app shall establish and hold two TCP connections to the chassis's IPv4 address (which may drift under DHCP) via `CarLink`: a command connection (port `4000`) and a camera connection (port `7000`).
+- **FR-2**: Command sends shall be a single line of ASCII text with `#`-delimited fields, with a trailing newline (`\n`) appended (appending the newline is `CarLink`'s responsibility). Ordinary commands are fire-and-forget; `CMD_POWER` and `CMD_SONIC` return a response line.
+- **FR-3**: If either connection becomes `failed`, the app shall attempt auto-reconnect at roughly 1 s intervals with no user action. On an explicit `cancelled` (an app-initiated disconnect) it shall not reconnect.
+- **FR-4**: The connection state of each of the command and camera connections (`cmdConnected` / `camConnected`) shall be shown persistently in the UI as an indicator (green = connected / red = disconnected) — the HUD "cmd" / "cam" dots.
+- **FR-5**: The user shall be able to edit the chassis IP in the settings screen; after a change, a reconnect action (`btn.reconnect`) applies it. The IP shall be persisted (`UserDefaults` key `carIP`).
+- **FR-6**: The camera stream shall be received as frames of the form "a 4-byte little-endian length prefix + that many JPEG bytes." A length of 0 or less, or 4,000,000 bytes or more, shall be discarded as an invalid frame.
+- **FR-7**: At app start (`ctl.start()`) the command and camera connections shall be opened and `CMD_VIDEO#1` sent to begin the video stream. On stop (`stopAll()`) the app shall send a stop command and `CMD_VIDEO#0` and close both connections.
 
-### 5.2 ライブカメラ表示
+### 5.2 Live Camera Display
 
-- **FR-8**: 受信した JPEG フレームを復号し、画面全体（`scaledToFill`）に背景として表示すること。HUD パネルは映像の上にフローティング表示すること。
-- **FR-9**: 映像未受信時は黒背景と "video.none"（映像なし）プレースホルダを表示すること。
-- **FR-10**: 映像上に 3×3 の参照グリッド（`GridOverlay`）を薄く重畳表示すること。
-- **FR-11**: テレメトリ帯（解像度・pan 角・tilt 角）を HUD に表示すること。表示値は実際の状態（解像度、現在の pan/tilt 角度）を反映すること。
-- **FR-12**: 最新フレームの受信時刻（`lastFrameAt`）を保持し、ホスト側の映像途絶（visionStale）判定に用いること。
+- **FR-8**: The received JPEG frame shall be decoded and shown as the background across the entire screen (`scaledToFill`). The HUD panels shall float above the video.
+- **FR-9**: When no video has been received, a black background and a "video.none" (no video) placeholder shall be shown.
+- **FR-10**: A 3×3 reference grid (`GridOverlay`) shall be overlaid faintly on the video.
+- **FR-11**: A telemetry strip (resolution · pan angle · tilt angle) shall be shown in the HUD. The displayed values shall reflect the actual state (resolution, current pan/tilt angles).
+- **FR-12**: The receive timestamp of the latest frame (`lastFrameAt`) shall be retained and used for the host-side video-stall (visionStale) determination.
 
-### 5.3 ゴール入力（テキスト & 音声）
+### 5.3 Goal Entry (Text & Voice)
 
-- **FR-13**: テキスト入力フィールドからゴールを入力し、送信ボタン（`btn.send`）で確定できること。空文字（空白のみ）の送信は不可とすること。
-- **FR-14**: マイクボタンで音声認識（STT, `SFSpeechRecognizer`）を開始・停止でき、認識結果（`transcript`）を入力フィールドに反映すること。認識は逐次結果（partial results）を表示すること。
-- **FR-15**: 音声認識のロケールは選択言語に追従すること（日本語なら `ja-JP`、英語なら `en-US`）。
-- **FR-16**: 初回のマイク使用時に、マイク権限と音声認識権限の許可を要求すること。
-- **FR-17**: ゴール確定時（`setGoal`）は前後空白を除去し、直近メモリ（`memory`）をクリアし、緊急停止フラグ（`estop`）を解除し、未起動なら制御ループを開始すること。
+- **FR-13**: The user shall be able to enter a goal in the text field and commit it with the send button (`btn.send`). Sending an empty string (whitespace only) shall not be allowed.
+- **FR-14**: The mic button shall start/stop speech recognition (STT, `SFSpeechRecognizer`) and reflect the recognized text (`transcript`) into the input field. Recognition shall display partial results incrementally.
+- **FR-15**: The recognition locale shall follow the selected language (`ja-JP` for Japanese, `en-US` for English).
+- **FR-16**: On first use of the mic, microphone and speech-recognition permissions shall be requested.
+- **FR-17**: On goal commit (`setGoal`), leading/trailing whitespace shall be stripped, recent memory (`memory`) cleared, the emergency-stop flag (`estop`) cleared, and the control loop started if it is not already running.
 
-### 5.4 AI Vision → 行動の自律ループ
+### 5.4 AI Vision → Action Autonomous Loop
 
-- **FR-18**: ゴールが設定され、緊急停止でなく、映像フレームが取得できている場合、決定周期（約 0.7 Hz）ごとに `Brain.decide` で OpenAI の Vision チャット補完 API（`https://api.openai.com/v1/chat/completions`）を呼び出すこと。
-- **FR-19**: モデルへの入力は、システムプロンプト（皮質としての役割・出力 JSON スキーマ）、ゴール、直近メモリ（最新 4 件）、および 1 枚の JPEG フレーム（`detail: "low"`）とすること。使用モデル名はユーザー設定（既定 `gpt-4o-mini`）に従うこと。
-- **FR-20**: モデルは JSON オブジェクト 1 個のみを返し、アプリはそれを `Intent`（throttle -1..1 / steer -1..1 / duration_ms 100..800 / pan 0..180 / tilt 0..180 / face / observation / task_state）に解釈すること。解析不能時は安全側（`Intent.hold` = 全停止）にフォールバックすること。
-- **FR-21**: モデルは生のモーター数値を出力せず、意味的な行動のみを出す。`Dispatcher` が意味 → `CMD_*` 文字列への変換・クランプ・デッドゾーン処理を一手に担い、モデルが不正・危険なコマンドを直接出せない構造とすること。
-- **FR-22**: 駆動は**自己失効するパルス**として扱うこと。決定ティックで `duration_ms` を受け取り、`pulseUntil` を現在時刻 + duration に設定し、ハートビートでは `pulseUntil` を過ぎたら駆動を送らない（停止扱い）こと。遅延・失敗したティックがあっても車体は自動停止する。
-- **FR-23**: 決定結果に pan/tilt が含まれる場合は `Dispatcher.look()` で頭部を、face が含まれる場合は `Dispatcher.face()` で表情を送出すること。
-- **FR-24**: `observation`（所見テキスト）と `task_state`（searching / approaching / done / blocked）を HUD に表示し、所見は TTS で読み上げること。
-- **FR-25**: `task_state` が `done` になったらゴールをクリアし、自律ループを停止状態（hold）に戻すこと。`blocked` は単発では終了せず、連続して発生した場合のみゴールを諦めること（現行基準: 3 回連続）。
-- **FR-26**: 直近所見をメモリ（最大 8 件、超過時は古いものから破棄）として保持し、次回の決定入力に含めること。
-- **FR-27**: 差動駆動は throttle/steer（各 -1..1、+throttle=前進 / +steer=右）を左右タンクペアへ変換し、`CMD_MOTOR#<left>#0#<right>` の形式で送出すること。
+- **FR-18**: When a goal is set, there is no emergency stop, and a video frame is available, the app shall — each decision cycle (~0.7 Hz) — call OpenAI's Vision chat-completions API (`https://api.openai.com/v1/chat/completions`) via `Brain.decide`.
+- **FR-19**: The input to the model shall be: the system prompt (its role as the cortex + the output JSON schema), the goal, recent memory (**the latest 12 entries**), and a single JPEG frame (`detail: "low"`). The model name shall follow the user setting (default `gpt-4o-mini`).
+- **FR-20**: The model shall return exactly one JSON object, which the app interprets into an `Intent` (throttle -1..1 / steer -1..1 / duration_ms 100..800 / pan 0..180 / tilt 0..180 / observation / task_state, plus the fused-exploration fields forward_open 0..1 and hazard reported while searching — see FR-67). On unparseable output it shall fall back to the safe side (`Intent.hold` = full stop). (A legacy `face` field is still tolerated by the parser but the model is no longer prompted for it and it is not dispatched — see FR-23.)
+- **FR-21**: The model shall not output raw motor numbers; it emits only semantic actions. `Dispatcher` alone owns the semantic → `CMD_*` translation, clamping, and dead-zone handling, so the model cannot emit an illegal or dangerous command directly.
+- **FR-22**: Drive shall be treated as a **self-expiring pulse**. Each decision tick receives `duration_ms` and sets `pulseUntil` to now + duration; the heartbeat sends no drive (treated as stopped) once `pulseUntil` has passed. Even if a tick is delayed or fails, the chassis auto-stops.
+- **FR-23**: When a decision includes pan/tilt, the head shall be aimed via `Dispatcher.look()` (through `aim()`). A semantic LED-matrix face interface exists (`Dispatcher.face()` / `Dispatcher.faceModes`), but the live autonomy loop does **not** dispatch a matrix face; human-robot expression (HRI) is carried by body-LED cues instead (see FR-28/FR-29 and `LedLanguage`).
+- **FR-24**: `observation` (observation text) and `task_state` (searching / approaching / done / blocked) shall be shown in the HUD, and the observation shall be read aloud by TTS.
+- **FR-25**: When `task_state` becomes `done`, the goal shall be cleared and the autonomous loop returned to the stopped (hold) state. `blocked` shall not end the mission on a single occurrence; the goal is abandoned only when it recurs several times in a row (current criterion: 3 consecutive).
+- **FR-26**: Recent observations shall be kept as memory (**up to 12 entries; on overflow the oldest are dropped**) and included in the next decision input.
+- **FR-27**: Differential drive shall convert throttle/steer (each -1..1, +throttle = forward / +steer = right) into a left/right tank pair and send it in the form `CMD_MOTOR#<left>#0#<right>`.
 
-#### 5.4.1 探索戦略（スキャン＆リロケート）— 2026-07-26 追加
+#### 5.4.1 Exploration strategy (scan & relocate)
 
-> 背景: FR-18〜27 は「見る→判断→少し動く→また見る」の熟慮ループと `task_state` のラベルを定めるが、**ゴールが見つからないときにどう探すか（探索戦略）は未定義**で、VLM のプロンプト任せだった。結果、実車で「止まって首を振る」だけで新しい場所へ移動して探し直すループが回らなかった。衝突回避（v1.1.20）を決定論的なホスト状態機械にして安定したのと同様に、探索も**ホスト側で構造を保証**する。これは衝突回避とは**別軸**の関心事である。
+> Background: FR-18–27 define the deliberative "look → decide → move a little → look again" loop and the `task_state` labels, but **how to search when the goal is not found (the exploration strategy) was left undefined** and delegated to the VLM prompt. As a result, on the real car the loop would "stop and sweep the head" without a loop that moves to a new spot and searches again. Just as making collision avoidance a deterministic host state machine stabilized it, exploration is likewise **guaranteed structurally on the host**. This is a **separate concern** from collision avoidance.
 
-- **FR-54（探索状態機械：スキャン＆リロケート）**: ゴールが物体探索であり、VLM が当該フレームでゴールを視認できていない（`task_state=searching`／`blocked`）間、**ホストが探索を決定論的な状態機械で駆動する**こと。この間 VLM の役割は「ゴールが見えるか」の知覚判断に縮小し、VLM が返す throttle/steer/pan/tilt は参考値として扱う（ホストが上書きする）。状態機械は少なくとも次を満たすこと:
-  1. **SCAN（その場走査）**: 車体を停止（throttle 0）したまま頭部 pan を規定アーク（複数角度・本個体の可動半球内・tilt に上下変化を含む）で順に振り、各角度につき 1 決定ぶん VLM に視認判定させる。アークを一巡しても見つからなければ RELOCATE へ遷移する。同じ地点を巡回し続けないこと。
-  2. **RELOCATE（新地点へ移動）**: まず頭部を正面（pan 90 / drive tilt）へ戻して前方距離を確定し、前方が開けていれば（sonar 距離 ≥ 規定クリア閾値）短い前進パルスで新しい地点へ移動する。前方が塞がっていればその場ピボットで新しい進行方向へ向け直す。1 アクションののち SCAN へ戻る。
-  3. **繰り返し**: 新地点で再び SCAN し、地点ごとに部屋を巡回する。
-- **FR-55（探索の明け渡し）**: VLM がゴールを視認して `task_state=approaching`／`done` を返した時点で、ホストは探索状態機械を直ちに解除し、駆動判断（throttle/steer/pan/tilt）を VLM に明け渡すこと（接近・到達は従来どおり VLM が担う）。ゴール確定（`setGoal`）・STOP・全停止・モード切替で探索状態はリセットすること。
-- **FR-56（探索の安全従属）**: 探索状態機械は、衝突回避リフレックス（FR—ホスト脱出）・E-STOP・dry-run・デッドマン・低電圧停止のいずれにも従属すること（優先度 SAFETY > 探索）。RELOCATE の前進パルスはファームの前進 veto（<20cm）＋ホスト衝突脱出（<25cm）に守られること。
+- **FR-54 (Search state machine: scan & relocate)**: While the goal is an object search and the VLM cannot see the goal in the current frame (`task_state=searching` / `blocked`), the **host shall drive exploration with a deterministic state machine**. During this time the VLM's role narrows to the perceptual judgment "can the goal be seen?", and the throttle/steer/pan/tilt it returns are treated as advisory (the host overrides them). The state machine shall satisfy at least the following:
+  1. **SCAN (sweep in place)**: with the chassis stopped (throttle 0), sweep the head pan across a prescribed arc (multiple angles, within this unit's reachable hemisphere, including up/down tilt variation), giving the VLM one decision to judge visibility at each angle. If a full pass finds nothing, transition to RELOCATE. It shall not keep circling the same spot.
+  2. **RELOCATE (move to a new spot)**: first return the head to front (pan 90 / drive tilt) to fix the forward distance; if the front is open (sonar distance ≥ the prescribed clearance threshold), move to a new spot with a short forward pulse. If the front is blocked, pivot in place to reorient toward a new heading. After one action, return to SCAN.
+  3. **Repeat**: SCAN again at the new spot, touring the room spot by spot.
+- **FR-55 (Yield of exploration)**: The moment the VLM sees the goal and returns `task_state=approaching` / `done`, the host shall immediately release the search state machine and yield the drive decision (throttle/steer/pan/tilt) to the VLM (approach and arrival remain the VLM's job as before). Goal commit (`setGoal`), STOP, stop-all, and mode switch shall reset the search state.
+- **FR-56 (Safety subordination of exploration)**: The search state machine shall be subordinate to the collision-avoidance reflex (FR — host escape), E-STOP, dry-run, deadman, and low-voltage stop (priority SAFETY > search). RELOCATE's forward pulse shall be protected by the firmware forward veto (<20 cm) plus the host collision escape (<25 cm).
 
-#### 5.4.2 融合探索（カメラ×距離センサー）— 2026-07-27 追加
+#### 5.4.2 Fused exploration (camera × distance sensor)
 
-> 背景: FR-54〜56 の探索は超音波1本の前方ビームだけで移動方向を決め、カメラのシーン情報を活かせていない（塞がると盲目ピボット）。超音波はカメラと同じ pan/tilt 首に同架されているため、**首を振れば各方向の距離を測れる**。これを VLM の意味理解と融合し、賢い探索にする。設計は DESIGN.md §16。オドメトリ/IMU が無いため**永続的な空間マップ(SLAM)は作らない**（各地点の一時ローカル判断のみ）。
+> Background: the FR-54–56 search decides its heading from a single forward ultrasonic beam and cannot use the camera's scene information (when blocked, it pivots blindly). Because the ultrasonic sensor is co-mounted on the same pan/tilt head as the camera, **sweeping the head measures distance in each direction**. Fusing this with the VLM's semantic understanding makes the search smarter. The design is in DESIGN.md §16. With no odometry/IMU, **no persistent spatial map (SLAM) is built** — only transient local judgments at each spot.
 
-- **FR-66（距離ファンの取得）**: 探索のスキャン中、頭部を各 pan 角へ向けて整定したら**その向きの超音波距離を読み取り**、pan 角に帰属させて一時保持（`spotFan`）すること。地点を離れたら破棄し、永続保存しないこと。距離ポーリングの「正面のみ」ゲートは、スキャン各角で整定していれば読めるよう拡張すること。
-- **FR-67（VLM の方向別知覚）**: VLM は探索フレームごとに、今向いている方向の**開放度 `forward_open`（0..1）**と**`hazard`（none/soft/ledge/wall）**を返すこと。ホストはこれを距離ファンと融合して進行方向を決める（VLM は探索中の駆動値を出さない）。
-- **FR-68（融合による方向選択）**: RELOCATE では、各方向に「超音波距離（正規化）× カメラ開放度」の融合スコアを付け、**相互チェック**（sonar 近距離<閾値=実障害物として除外／sonar 空きでも VLM 開放度が低ければ柔軟障害物として減点／VLM 開けてても sonar 近ければ sonar 優先）を適用し、最良方向を選ぶこと。横方向なら body をピボットで正面へ入れてから前進すること。
-- **FR-69（縮退動作）**: 全方向が閉/低スコアのときは段階的に縮退（最遠方向へ1歩→数周ダメなら `blocked` 検討）し、無限ピボットに陥らないこと。
-- **FR-70（暗所での融合フォールバック）**: 低照度（frame 輝度低）では VLM の視認・開放度の信頼度を下げ（融合重み W_VLM を縮小〜0）、超音波主体＋クリープ＋ヘッドライトへフォールバックすること。偽の approaching/done を出さないこと（v1.1.38 の暗所ガードを維持）。
-- **FR-71（融合探索の安全従属・パリティ）**: 融合探索は `Intent` を作るのみで、最終駆動はアービタが決定し、E-STOP・dry-run・デッドマン・低電圧・衝突脱出・ファーム前進 veto がすべて上位であること。LAN（Swift）と Remote（Python）で同一挙動とすること。
+- **FR-66 (Acquire a distance fan)**: During a search scan, after the head settles at each pan angle, **read the ultrasonic distance in that heading**, attribute it to the pan angle, and hold it transiently (`spotFan`). Discard it on leaving the spot; do not persist it. The "front only" gate on distance polling shall be widened so that a reading can be taken whenever the head has settled at each scan angle.
+- **FR-67 (VLM per-direction perception)**: For each search frame the VLM shall return the **openness `forward_open` (0..1)** and the **`hazard` (none/soft/ledge/wall)** of the direction the head currently faces. The host fuses these with the distance fan to decide the heading (the VLM does not emit drive values while searching).
+- **FR-68 (Direction selection by fusion)**: In RELOCATE, each direction is scored by "ultrasonic distance (normalized) × camera openness," with a **cross-check** applied (sonar near-range < threshold = a real obstacle, excluded / sonar clear but low VLM openness = a soft obstacle, penalized / VLM open but sonar near = sonar wins), and the best direction is chosen. If it is lateral, pivot the body to bring it to front before driving forward.
+- **FR-69 (Degraded behavior)**: When every direction is closed/low-scoring, degrade gradually (one step toward the farthest direction → if several rounds fail, consider `blocked`) and avoid falling into an endless pivot.
+- **FR-70 (Fusion fallback in the dark)**: In low light (low frame luma), lower the confidence of the VLM's visibility/openness (shrink the fusion weight W_VLM toward 0) and fall back to sonar-led + creep + headlight. Do not emit false approaching/done (retain the low-light guard).
+- **FR-71 (Safety subordination / parity of fused exploration)**: Fused exploration only produces an `Intent`; the arbiter makes the final drive decision, and E-STOP, dry-run, deadman, low-voltage, collision escape, and the firmware forward veto all sit above it. Behavior shall be identical on LAN (Swift) and Remote (Python).
 
-### 5.5 表情・ボディ表現（HRI 出力）
+### 5.5 Expression / Body Output (HRI)
 
-- **FR-28**: LED マトリクス顔表情を `CMD_MATRIX_MOD#<mode>` で制御できること。意味名（off/rotate/cry/smile/wheel_r/wheel_l/blink/random）を `Dispatcher.faceModes` でモード番号へ対応付けること。
-- **FR-29**: ボディ LED（`CMD_LED_MOD`）およびブザー（`CMD_BUZZER`、可変音のみ、ブロッキングする `Buzzer_Alert` は使用しない）の送出インタフェースを提供すること。
+- **FR-28**: The LED-matrix face shall be controllable via `CMD_MATRIX_MOD#<mode>`, with semantic names (off/rotate/cry/smile/wheel_r/wheel_l/blink/random) mapped to mode numbers by `Dispatcher.faceModes`. This interface exists for completeness; the current autonomous loop does not drive the matrix face — HRI is carried by body-LED cues (FR-29).
+- **FR-29**: A send interface shall be provided for the body LEDs (`CMD_LED_MOD`) and the buzzer (`CMD_BUZZER`, variable tone only; the blocking `Buzzer_Alert` is not used).
 
-### 5.6 アプリ内サーボキャリブレーション
+### 5.6 In-App Servo Calibration
 
-> 背景: この個体では pan/tilt サーボがファームウェアの想定と**入れ替わっている**。servo1（ch0）= TILT（上下）、servo2（ch1）= PAN（左右）。pan の正面中立はおよそ 90°、tilt の水平は実測およそ 95°（小さい値=下、大きい値=上）。`CMD_CAMERA` は軸の意味が本個体と合わないため、正確な制御は `CMD_SERVO` 2 本で行う。キャリブレーションは**再フラッシュではなくアプリ内**で調整できなければならない。
+> Background: on this individual unit the pan/tilt servos are **swapped** relative to the firmware's assumption. servo1 (ch0) = TILT (up/down), servo2 (ch1) = PAN (left/right). Pan's front neutral is roughly 90°; tilt's level is measured at roughly 95° (smaller = down, larger = up). Because `CMD_CAMERA`'s axis meanings do not match this unit, precise control is done with two `CMD_SERVO` commands. Calibration must be adjustable **in-app rather than by re-flashing**.
 
-- **FR-30**: 設定画面に **pan/tilt スワップトグル**を設け、ON のとき意味的 pan を servo2（ch1）へ、意味的 tilt を servo1（ch0）へ割り当てること。
-- **FR-31**: 設定画面に **pan 中立（正面）オフセット**および **tilt 水平オフセット**の調整スライダを設けること。スライダ操作は `CMD_SERVO#<index>#<angle>` を用いて対象サーボを**リアルタイムに動かして**確認できること。
-- **FR-32**: スワップ設定および pan/tilt 中立オフセットは永続化すること（`UserDefaults`）。
-- **FR-33**: `Dispatcher.look()`（意味的 pan/tilt → 実コマンド）は、スワップ設定と中立オフセットを通して各軸を解決し、正しい物理軸・可動域に対して `CMD_SERVO#<index>#<angle>` を発行すること（`CMD_CAMERA` の固定軸割り当て・tilt 下限に縛られないこと）。角度は 0〜180° にクランプすること。
-- **FR-34**: 意味的 tilt は 90° を水平、90°超を上、90°未満を下として扱い、本個体の実測水平（raw ≈95°）へ写像すること。設定スライダは raw 0〜180° の全域を扱い、既存端末の古い水平値を安全側に移行できること。
+- **FR-30**: The settings screen shall provide a **pan/tilt swap toggle**; when ON, semantic pan is assigned to servo2 (ch1) and semantic tilt to servo1 (ch0).
+- **FR-31**: The settings screen shall provide adjustment sliders for the **pan neutral (front) offset** and the **tilt level offset**. Operating a slider shall move the target servo **in real time** using `CMD_SERVO#<index>#<angle>` for confirmation.
+- **FR-32**: The swap setting and the pan/tilt neutral offsets shall be persisted (`UserDefaults`).
+- **FR-33**: `Dispatcher.look()` (semantic pan/tilt → real command) shall resolve each axis through the swap setting and the neutral offsets and issue `CMD_SERVO#<index>#<angle>` against the correct physical axis and travel range (not bound by `CMD_CAMERA`'s fixed axis assignment or tilt lower limit). Angles shall be clamped to 0–180°.
+- **FR-34**: Semantic tilt shall treat 90° as level, above 90° as up, and below 90° as down, mapping onto this unit's measured level (raw ≈ 95°). The settings slider shall span the full raw 0–180° range and safely migrate the old level value on existing devices.
 
-### 5.7 緊急停止
+### 5.7 Emergency Stop
 
-- **FR-35**: 画面下部に常時可視の大型 STOP ボタン（`btn.stop`）を設けること。押下で即時に `CMD_MOTOR#0#0#0`（停止）を送り、`estop` を立て、ゴールをクリアし、状態表示を `status.estop` にすること。
-- **FR-36**: 緊急停止はドライランのオン/オフに関わらず、また自律ループの状態に関わらず、常に停止コマンドを送出できること（停止はネットワーク往復を経由する AI 判断に依存しないこと）。
-- **FR-37**: 設定画面に「すべて停止」（`btn.stopAll`）を設け、ループ停止・停止コマンド・映像停止・接続クローズを一括で行えること。
+- **FR-35**: A large, always-visible STOP button (`btn.stop`) shall be placed at the bottom of the screen. Pressing it shall immediately send `CMD_MOTOR#0#0#0` (stop), set `estop`, clear the goal, and set the status display to `status.estop`.
+- **FR-36**: The emergency stop shall be able to send the stop command regardless of whether dry-run is on or off and regardless of the autonomous loop's state (stopping must not depend on an AI decision that goes over a network round-trip).
+- **FR-37**: The settings screen shall provide "stop all" (`btn.stopAll`) to stop the loop, send the stop command, stop video, and close the connections in one action.
 
-### 5.8 ドライラン（安全既定）
+### 5.8 Dry-Run (Safe Default)
 
-- **FR-38**: ドライランモードを備え、ON のときはモーター駆動コマンド（`CMD_MOTOR` の駆動値）を一切送らず、計画・所見表示・TTS・頭部/表情送出・ログのみ行うこと。
-- **FR-39**: ドライランは既定で ON とし、アプリ起動ごとに ON に戻る（永続化して OFF のまま起動しない）こと。バッテリー未搭載中も安全に動かせること。
-- **FR-40**: ドライラン中である旨を HUD に明示（"DRY" バッジ）すること。
+- **FR-38**: A dry-run mode shall be provided; when ON it shall send no motor-drive command (no `CMD_MOTOR` drive values) and shall only plan, display observations, run TTS, send head/expression commands, and log.
+- **FR-39**: Dry-run shall default to ON and return to ON every app launch (it is not persisted in a way that starts up OFF). This keeps the car safe to operate even without the battery installed.
+- **FR-40**: The HUD shall clearly indicate dry-run is active (a "DRY" badge).
 
-### 5.9 ホスト側安全リフレックス
+### 5.9 Host-Side Safety Reflexes
 
-- **FR-41**: ハートビートごとに安全条件を評価し、以下のいずれかが成立したら駆動を停止（`CMD_MOTOR#0#0#0`）すること。
-  - コマンド接続断（`safety.linkDown`）
-  - 映像途絶: 最新フレームからの経過が `visionStaleMs`（800 ms）超（`safety.visionStale`）
-  - デッドマン: 最後の意図更新からの経過が `deadmanMs`（500 ms）超（`safety.deadman`）
-  - 低電圧: 低バッテリー検知（`safety.lowBattery`）
-- **FR-42**: 低バッテリー検知のため `CMD_POWER` を約 3 秒ごとに送出し、返信 `CMD_POWER#<voltage>` を受信・解析し、校正済み電圧が 6.6 V 未満なら駆動を止めること。UI は電圧バッジと低電圧バナーで停止理由を明示すること。
-- **FR-43**: 現在の安全/走行状態（linkDown / visionStale / deadman / lowBattery / driving / hold / estop / idle）を HUD のステータス表示に反映すること。
+- **FR-41**: Each heartbeat shall evaluate safety conditions and stop drive (`CMD_MOTOR#0#0#0`) if any of the following holds:
+  - Command link down (`safety.linkDown`)
+  - Video stall: time since the latest frame exceeds `visionStaleMs` (800 ms) (`safety.visionStale`)
+  - Deadman: time since the last intent update exceeds `deadmanMs` (500 ms) (`safety.deadman`)
+  - Low voltage: low-battery detected (`safety.lowBattery`)
+- **FR-42**: For low-battery detection, `CMD_POWER` shall be sent about every 3 s, its reply `CMD_POWER#<voltage>` received and parsed, and drive stopped when the calibrated voltage is below 6.6 V. The UI shall make the stop reason clear with a voltage badge and a low-voltage banner.
+- **FR-43**: The current safety/drive state (linkDown / visionStale / deadman / lowBattery / driving / hold / estop / idle) shall be reflected in the HUD status display.
 
-### 5.10 設定
+### 5.10 Settings
 
-- **FR-44**: 設定画面（`ConfigView`）で以下を編集できること: 車体 IP、速度上限（`speedCap`）、ドライラン、OpenAI API キー、モデル名、言語、サーボキャリブレーション（スワップ・中立オフセット）。
-- **FR-45**: 速度上限は 1600〜4095 の範囲でステップ 100 で調整できること。既定は 2000。
-- **FR-46**: OpenAI API キー入力は伏字（`SecureField`）で行うこと。
-- **FR-47**: 設定のうち carIP / apiKey / model / lang / linkMode / controlMode / speedCap / panInvert / motorTrim / サーボキャリブレーションは永続化すること。ドライランは安全側の既定値（dry-run=ON）で毎起動リセットすること。
+- **FR-44**: The settings screen (`ConfigView`) shall allow editing of: chassis IP, link mode (LAN / Remote), speed cap (`speedCap`), dry-run, the OpenAI API key, model name, language, and servo calibration (swap · neutral offsets). The AI ↔ Manual control-mode selector is presented in the HUD (`modeToggle`); both link mode and control mode are persisted (see FR-47).
+- **FR-45**: The speed cap shall be adjustable over 1600–4095 in steps of 100. The default is 2000.
+- **FR-46**: OpenAI API-key entry shall be masked (`SecureField`).
+- **FR-47**: Of the settings, carIP / apiKey / model / lang / linkMode / controlMode / speedCap / panInvert / motorTrim / servo calibration shall be persisted. Dry-run shall reset to its safe default (dry-run = ON) every launch.
 
-### 5.12 品質受入条件（安全・状態遷移・演出）
+### 5.11 Bilingual Support (EN / JA)
 
-- **FR-57（STOP 状態リセット）**: STOP / stopAll / モード切替 / AI↔Manual 切替は、駆動パルス、直接テレオペ、衝突脱出、探索、接近ラッチ、未完了の Vision 判断、TTS キュー、完了演出をすべて停止または失効させること。START、再接続、モード切替後に新しいユーザー操作なしで車体が再走行してはならない。
-- **FR-58（STOP の表示条件）**: STOP は AI ゴール実行中、Manual モード走行中、自然言語の直接移動パルス中、衝突脱出中、完了演出中に押せること。アイドル時は START に戻してよいが、車体が動きうる状態で STOP を隠してはならない。
-- **FR-59（直接移動コマンド）**: 「2秒後進して」「前進」「右を向いて」「止まって」等はゴール探索ではなく時間付き直接テレオペとして扱い、AI ループを一時停止すること。反対に「止まっている人を探して」「bus stop を探して」等の探索文は drive キーワードに引きずられず通常ゴールとして扱うこと。直接後進は救済動作のため前方衝突 veto の対象にしないが、E-STOP、低電圧、dry-run には従属すること。
-- **FR-60（衝突脱出）**: AI が前進意図を持ち、鮮度 1.5 秒以内の前方距離が通常 25 cm 未満（低照度時 32 cm 未満）になったら、10 Hz アービタで衝突脱出をラッチすること。脱出は後退（最大 1.4 秒、40 cm 超でクリア）→その場ピボット（約 0.65 秒）で構成し、Vision 判断待ちで停止しないこと。ファームは 20 cm 未満の前進を拒否すること。
-- **FR-61（距離センサの適用範囲）**: HC-SR04 はヘッド正面方向のみを測る。前進中はヘッドを前方姿勢へ戻して測距し、横向き/下向きの距離を「前方」と誤用しないこと。後方、側方、床端、階段、低い/柔らかい/細い/斜め/ガラス/布/無エコー障害物は保証対象外として、低速・短パルス・監視付き運用で補うこと。
-- **FR-62（低照度モード）**: フレーム平均輝度が 55 未満なら低照度と判定し、白ヘッドライトを点灯し、探索/リロケート前進を通常より遅く短くすること（現行: throttle 0.30、250 ms、前方クリア 65 cm）。低照度モードは完全な衝突保証ではなく、カメラが見えにくい環境でのリスク低減である。
-- **FR-63（Manual / AI 切替）**: Manual と AI の切替は必ず停止を挟み、古いゴール・探索・接近・テレオペ・脱出状態を引き継がないこと。Manual から START しただけで古い AI ゴールが復帰してはならない。
-- **FR-64（TTS）**: TTS は通常は直近所見を読み上げるが、STOP / stopAll / 新規ゴール / モード切替では即時停止し、古い発話が後から続かないこと。重複所見の読み上げは抑制し、TTS が駆動停止を遅らせてはならない。
-- **FR-65（done 演出）**: `done` 到達時は車体を停止し、LAN では WS2812 rainbow と短いファンファーレを 5 秒未満で再生してよい。STOP / 新規ゴール / モード切替 / stopAll は演出を即時停止し、LED 状態を通常安全キューへ戻すこと。
+- **FR-48**: Every UI string shall be displayable in Japanese and English via `LocalizedStringKey` and `Localizable.strings` under `en.lproj` / `ja.lproj`.
+- **FR-49**: The settings screen shall provide a language picker (Automatic / English / 日本語). On "Automatic," resolve to Japanese when the device locale is Japanese and to English otherwise.
+- **FR-50**: The selected language shall be applied across the whole UI as the environment locale (`.environment(\.locale, …)`), and the AI response (`observation`) generation language, the TTS voice language, and the STT recognition locale shall all follow it.
 
-### 5.11 二言語対応（EN / JA）
+### 5.12 Quality Acceptance Criteria (safety · state transitions · celebration)
 
-- **FR-48**: すべての UI 文字列は `LocalizedStringKey` と `en.lproj` / `ja.lproj` の `Localizable.strings` を通じて日本語・英語で表示できること。
-- **FR-49**: 設定画面に言語ピッカー（自動 / English / 日本語）を設けること。「自動」時は端末ロケールが日本語なら日本語、それ以外は英語に解決すること。
-- **FR-50**: 選択言語は環境ロケール（`.environment(\.locale, …)`）として UI 全体に反映し、AI 応答（`observation`）テキストの生成言語、TTS の音声言語、STT の認識ロケールのすべてがこれに追従すること。
-
----
-
-## 6. 非機能要件（NFR）
-
-### 6.1 レイテンシと性能
-- **NFR-1**: 1 認知ティックあたり約 0.5〜2 秒のレイテンシ（主に Vision API 呼び出し）を**許容**すること。決定周期は 0.5〜2 Hz（既定 0.7 Hz）の熟慮ループとする。
-- **NFR-2**: ハートビート（コマンド送出/安全評価）は 10 Hz 程度で動作し、AI 応答の遅延に影響されないこと。
-- **NFR-3**: カメラ表示は HQVGA（240×176）で概ね 10〜15 fps を実用動作点とすること。高解像度化は要求しない。
-- **NFR-4**: Vision API 呼び出しはコストを抑えるため低解像度画像（`detail: "low"`）と最小限のトークンで行うこと。
-
-### 6.2 安全性
-- **NFR-5**: 停止（緊急停止・各種リフレックス停止）はネットワーク往復や AI 判断に依存せず、アプリ内で完結して即時実行できること。
-- **NFR-6**: 既定でモーション不可（ドライラン ON）とし、モーション実行はバッテリー搭載かつ明示的なドライラン解除を要すること。
-- **NFR-7**: 駆動値はデッドゾーン下限 1600・最大 4095、および速度上限（`speedCap`）で二重にクランプすること。デッドゾーン未満は 0 にスナップすること。
-- **NFR-8**: 運用は屋内・平坦・低速・人による監視付きを前提とし、UI はこの前提を損なわない（例: 常時可視の STOP、DRY バッジ）こと。
-
-### 6.3 API キー・セキュリティ
-- **NFR-9**: OpenAI API キーはコードにハードコードしないこと。
-- **NFR-10**: API キーは端末内 `UserDefaults` に保存する（個人利用前提、暗号化なし）。この非暗号化保存はリスクとして明示し、ビルドを共有しない運用とすること。将来的な堅牢化として Keychain 移行を推奨する（推奨・非必須）。
-- **NFR-11**: API キーや個人情報を URL クエリやログに出力しないこと。API キーは Authorization ヘッダのみで送出すること。
-
-### 6.4 ネットワーク / DHCP
-- **NFR-12**: 車体 IP は DHCP により変動しうる前提とし、ユーザーが容易に更新・再接続できること。接続失敗時は自動再接続を試みつつ、状態を可視化すること。
-- **NFR-13**: iPhone・車体・インターネットが同一 LAN（家庭内ルータ, 2.4 GHz, STA モード）を共有すること。ローカルネットワークアクセス権限（`NSLocalNetworkUsageDescription`）を要求すること。
-
-### 6.5 プラットフォーム / ビルド
-- **NFR-14**: iOS ネイティブ SwiftUI アプリとして実装し、iPhone・縦向き固定で動作すること。
-- **NFR-15**: デプロイメントターゲットは iOS 17.0 とし、Xcode 26 / iOS 26 SDK でビルドできること。プロジェクトは XcodeGen（`project.yml`）で生成・管理すること。
-- **NFR-16**: 実行時に Mac を必要としないこと（ビルド・インストール時のみ Mac + Xcode が必要）。
-
-### 6.6 アクセシビリティ
-- **NFR-17**: 主要な操作要素（マイク、設定、STOP 等）に VoiceOver 用のアクセシビリティラベル（`a11y.*`）を付与すること。
-- **NFR-18**: 表示テキストは Dynamic Type に配慮し、グラス HUD 上でも十分なコントラスト（白文字・半透明素材）を確保すること。
-
-### 6.7 ローカライゼーション
-- **NFR-19**: 対応言語は英語・日本語の 2 言語（`CFBundleLocalizations = [en, ja]`）とし、UI・AI 応答・音声（TTS/STT）が一貫して選択言語で動作すること。
-- **NFR-20**: 新規 UI 文字列は必ず両言語の `Localizable.strings` に追加し、ハードコード文字列を残さないこと（テレメトリの数値・単位等の非翻訳トークンを除く）。
-
-### 6.8 信頼性・堅牢性
-- **NFR-21**: 一時的な Wi-Fi 断や AI 応答失敗によってアプリがクラッシュせず、安全側（停止/hold）に落ちること。
-- **NFR-22**: 車体側の patched firmware（切断時 stop-and-hold、オンデバイス・デッドマン）に依存し、アプリ側は接続を保持し続ける前提で設計すること。ソケット断が車体を再起動させない前提（`ESP.restart` 廃止）を活用すること。
-
-### 6.9 視覚デザイン（Liquid Glass）
-- **NFR-23**: カメラ映像を全画面背景とし、HUD パネルはフロスト加工（`.ultraThinMaterial`、iOS 26 では `.glassEffect()` に差し替え可能）のフローティングパネルとすること。ダークな視覚世界（`.preferredColorScheme(.dark)`）を基調とすること。
-- **NFR-24**: アプリアイコンはロボットのレンダー画像（1024²、`Assets.xcassets/AppIcon`）とすること。
+- **FR-57 (STOP state reset)**: STOP / stopAll / mode switch / AI↔Manual switch shall stop or invalidate all of: the drive pulse, direct teleop, collision escape, the search, the approach latch, an unfinished Vision decision, the TTS queue, and the completion celebration. After START, reconnect, or a mode switch, the car shall not re-drive without a fresh user action.
+- **FR-58 (STOP visibility conditions)**: STOP shall be pressable while an AI goal is executing, while driving in Manual mode, during a natural-language direct movement pulse, during collision escape, and during the completion celebration. When idle it may revert to START, but STOP must not be hidden while the car could move.
+- **FR-59 (Direct movement commands)**: "reverse for 2 seconds," "go forward," "turn right," "stop," etc. shall be treated as timed direct teleop rather than goal search, pausing the AI loop. Conversely, search phrasings like "find the person standing still" or "find the bus stop" shall not be captured by a drive keyword and shall be treated as ordinary goals. Direct reverse is a rescue action and is therefore exempt from the forward collision veto, but it remains subordinate to E-STOP, low voltage, and dry-run.
+- **FR-60 (Collision escape)**: When the AI intends to go forward and the forward distance — fresh within 1.5 s — falls below 25 cm normally (below 32 cm in low light), the 10 Hz arbiter shall latch a collision escape. The escape consists of reversing (up to 1.4 s, cleared past 40 cm) → an in-place pivot (~0.65 s), and shall not stall waiting on a Vision decision. The firmware shall refuse forward drive under 20 cm.
+- **FR-61 (Scope of the distance sensor)**: The HC-SR04 measures only the head's forward direction. While moving forward, return the head to a forward posture to measure, and do not misuse a sideways/downward distance as "forward." The rear, the sides, floor edges, stairs, and low / soft / thin / angled / glass / cloth / no-echo obstacles are not guaranteed and are covered by low-speed, short-pulse, supervised operation.
+- **FR-62 (Low-light mode)**: When the frame's mean luma is below 55, low light is declared, the white headlight is turned on, and the search/relocate forward drive is made slower and shorter than usual (current: throttle 0.30, 250 ms, forward-clear 65 cm). Low-light mode is not a full collision guarantee but a risk reduction where the camera sees poorly.
+- **FR-63 (Manual / AI switch)**: Every switch between Manual and AI shall insert a stop and shall not carry over an old goal, search, approach, teleop, or escape state. Merely pressing START from Manual must not resurrect an old AI goal.
+- **FR-64 (TTS)**: TTS normally reads the latest observation aloud, but on STOP / stopAll / new goal / mode switch it shall stop immediately so an old utterance does not trail on afterward. Duplicate-observation readouts shall be suppressed, and TTS shall never delay a drive stop.
+- **FR-65 (done celebration)**: On reaching `done`, the car shall stop, and on LAN a WS2812 rainbow and a short fanfare may play for under 5 s. STOP / new goal / mode switch / stopAll shall stop the celebration immediately and return the LED state to the normal safety cues.
 
 ---
 
-## 7. 制約・前提
+## 6. Non-Functional Requirements (NFR)
 
-### 7.1 ハードウェア / ファームウェア制約（HC）
+### 6.1 Latency and Performance
+- **NFR-1**: A latency of roughly 0.5–2 s per cognitive tick (mostly the Vision API call) shall be **tolerated**. The decision cycle is a deliberative loop at 0.5–2 Hz (default 0.7 Hz).
+- **NFR-2**: The heartbeat (command send / safety evaluation) shall run at about 10 Hz and shall not be affected by AI-response delay.
+- **NFR-3**: The camera display shall use HQVGA (240×176) at a practical operating point of roughly 10–15 fps. Higher resolution is not required.
+- **NFR-4**: To keep costs down, the Vision API call shall use a low-resolution image (`detail: "low"`) and minimal tokens.
 
-- **HC-1**: 車体は ESP32-WROVER。オンデバイス ML 推論は不可（GPU/NPU なし、RAM 少）。知覚・認知はすべてオフボード（本アプリ + クラウド）で行う。
-- **HC-2**: コマンドは TCP `4000`、`#` 区切りテキスト、`\n` 終端。トークン: `CMD_MOTOR` / `CMD_SERVO` / `CMD_CAMERA` / `CMD_LED` / `CMD_LED_MOD` / `CMD_MATRIX_MOD` / `CMD_BUZZER` / `CMD_VIDEO` / `CMD_POWER` / `CMD_SONIC` など。応答を返すのは `CMD_POWER#<voltage>` と `CMD_SONIC#<cm>`。
-- **HC-3**: カメラは TCP `7000`、`CMD_VIDEO#1` でゲート、フレームは 4 バイト LE 長 + JPEG。HQVGA 240×176。
-- **HC-4**: モーターは 4 輪だが `CMD_MOTOR` では左右タンクペアとして駆動（`CMD_MOTOR#<left>#0#<right>`）。各値 ±4095、|値|<1600 は 0（デッドゾーン）。
-- **HC-5**: サーボは PCA9685 経由。`Servo_1`(ch0)/`Servo_2`(ch1)。この個体は pan/tilt が**スワップ**（ch0=TILT, ch1=PAN）。正確な軸・可動域制御には `CMD_CAMERA` ではなく `CMD_SERVO#<index>#<angle>`（0〜180）を用いる。
-- **HC-6**: patched firmware `AI_Car_Firmware`: オンデバイス・デッドマン停止、切断時 stop-and-hold（`ESP.restart` は行わない）。デッドゾーン |speed|<1600 ⇒ 0。
-- **HC-7**: モーション・サーボ駆動・ボディ LED はバッテリー（18650×2）搭載時のみ。低電圧目安 `LOW_VOLTAGE_VALUE 2100`。
-- **HC-8**: この個体は HC-SR04 を前方ヘッドに増設済み。前方距離は `CMD_SONIC#<cm>` とファームの前進 veto で利用できる。ただしセンサは単一・前方向・ヘッド姿勢依存であり、後方/側方/床端/階段/低い/柔らかい/細い/斜め/ガラス/布/無エコー障害物の保証はない。よって低速・短パルス・監視付き運用を前提とする。
-- **HC-9**: GPIO 32 に `WS2812_PIN` と `PIN_BATTERY` が重複記載されているとの注記があり、ボディ LED とバッテリーテレメトリの同時利用は要ハードウェア確認（アプリはこの不確実性に依存しないこと）。
+### 6.2 Safety
+- **NFR-5**: Stops (emergency stop and the various reflex stops) shall not depend on a network round-trip or an AI decision; they shall complete in-app and execute immediately.
+- **NFR-6**: The default shall be motion-disabled (dry-run ON); executing motion shall require the battery installed and an explicit dry-run release.
+- **NFR-7**: Drive values shall be double-clamped by the dead-zone floor 1600 and max 4095 and by the speed cap (`speedCap`). Values under the dead zone shall snap to 0.
+- **NFR-8**: Operation shall assume indoor, flat, low-speed, human-supervised use, and the UI shall not undermine that premise (e.g. an always-visible STOP, the DRY badge).
 
-### 7.2 前提（Assumptions, AS）
+### 6.3 API Key / Security
+- **NFR-9**: The OpenAI API key shall not be hardcoded in the code.
+- **NFR-10**: The API key is stored in the device's `UserDefaults` (personal-use premise, no encryption). This unencrypted storage shall be stated as a risk, with a practice of not sharing the build. As future hardening, migration to the Keychain is recommended (recommended, non-mandatory).
+- **NFR-11**: The API key and personal information shall not be written to URL queries or logs. The API key shall be sent only in the Authorization header.
 
-- **AS-1**: 車体は STA モードで家庭内 Wi-Fi に参加済みで、iPhone と同一 LAN 上にある。
-- **AS-2**: 有効な OpenAI API キーと、Vision 対応モデル（既定 `gpt-4o-mini`）へのアクセスがある。
-- **AS-3**: 車体ファームは patched `AI_Car_Firmware`（デッドマン・stop-and-hold）で動作している。
-- **AS-4**: 運用環境は屋内・平坦・低速・人による監視付きで、段差や落下リスクがない。
-- **AS-5**: 単一所有者の個人利用であり、ビルドや API キーを第三者と共有しない。
-- **AS-6**: 実運用のモーション検証はバッテリー搭載後に行い、それまではドライランで機能検証する。
+### 6.4 Network / DHCP
+- **NFR-12**: The chassis IP shall be assumed to drift under DHCP, and the user shall be able to update and reconnect easily. On connection failure the app shall attempt auto-reconnect while making the state visible.
+- **NFR-13**: The iPhone, the chassis, and the internet shall share the same LAN (home router, 2.4 GHz, STA mode). Local-network access permission (`NSLocalNetworkUsageDescription`) shall be requested. (In Remote mode the LAN premise is between the home bridge and the car; see `REMOTE.md`.)
 
----
+### 6.5 Platform / Build
+- **NFR-14**: It shall be implemented as an iOS-native SwiftUI app and shall operate on iPhone in a fixed portrait orientation.
+- **NFR-15**: The deployment target shall be iOS 17.0, buildable with Xcode 26 / iOS 26 SDK. The project shall be generated and managed with XcodeGen (`project.yml`).
+- **NFR-16**: No Mac shall be required at runtime (a Mac + Xcode is needed only for build/install).
 
-## 8. 対象外（Out of Scope, OS）
+### 6.6 Accessibility
+- **NFR-17**: Key controls (mic, settings, STOP, etc.) shall carry VoiceOver accessibility labels (`a11y.*`).
+- **NFR-18**: Displayed text shall respect Dynamic Type and ensure adequate contrast even over the glass HUD (white text · semi-transparent material).
 
-- **OS-1**: 車体ファームウェアの実装（本アプリはインタフェース制約として参照するのみ）。
-- **OS-2**: オンデバイス（ESP32）の ML/CV 推論、SLAM、地図生成、オドメトリ。
-- **OS-3**: HC-SR04 を超える高速・全方位・床端/階段対応の障害物回避。後方/側方/崖センサ、ToF アレイ、SLAM 等は別フェーズ・別要件。
-- **OS-4**: SoftAP（`Sunshine`）モードでのクラウド運用（インターネット到達不可のため非対象。ローカル/オフラインモデル運用は本書の対象外）。
-- **OS-5**: 複数ユーザー / アカウント / クラウド同期、App Store 一般配布。
-- **OS-6**: iPad・横向きレイアウト、英語・日本語以外の言語。
-- **OS-7**: API キーの Keychain 化・暗号化保管（推奨事項として NFR-10 に記載するが、v1 の必須要件ではない）。
-- **OS-8**: 自律ループのオフライン動作（Vision API はネットワーク必須）。
+### 6.7 Localization
+- **NFR-19**: The supported languages shall be English and Japanese (`CFBundleLocalizations = [en, ja]`), with UI, AI responses, and audio (TTS/STT) operating consistently in the selected language.
+- **NFR-20**: New UI strings shall always be added to both languages' `Localizable.strings`, leaving no hardcoded string (excluding non-translated tokens such as telemetry numbers and units).
 
----
+### 6.8 Reliability / Robustness
+- **NFR-21**: A temporary Wi-Fi drop or an AI-response failure shall not crash the app; it shall fall to the safe side (stop/hold).
+- **NFR-22**: The design shall depend on the chassis's patched firmware (stop-and-hold on disconnect, on-device deadman) and hold the connection on the app side. It shall exploit the premise that a socket drop does not reboot the car (`ESP.restart` removed).
 
-## 付録 A: 実装状況注記（要件と現状コードの対応・honest gap）
-
-2026-07-28 時点で、旧ドラフトに残っていたサーボキャリブレーション、低バッテリー、HC-SR04 装着状態に関する古い前提は現状と合わない。現行コードではサーボ調整、低電圧停止、`CMD_SONIC`、衝突脱出、Manual/Remote/STOP の状態リセットが実装済みである。
-
-残る honest gap は、実装有無ではなく**実機受入の粒度**である。`QUALITY_ACCEPTANCE.md` に、FR/NFR/RFR/RNFR と実装・自動確認・実機確認の対応表を置き、リリース前に実車ログで埋めること。
-
----
-
-## 付録 B: 品質受入トレース
-
-リリース前の確認は `QUALITY_ACCEPTANCE.md` を正とする。ここでは STOP 後の再駆動禁止、直接移動コマンド、衝突脱出、低照度、低電圧、TTS/完了演出割り込み、Remote arm/disarm、Remote failure modes、認証/ログ redaction を、要件 ID・実装箇所・静的確認・実車確認に分けて追跡する。
+### 6.9 Visual Design (Liquid Glass)
+- **NFR-23**: The camera video shall be the full-screen background, and the HUD panels shall be frosted (`.ultraThinMaterial`, replaceable with `.glassEffect()` on iOS 26) floating panels. A dark visual world (`.preferredColorScheme(.dark)`) shall be the base.
+- **NFR-24**: The app icon shall be a render image of the robot (1024², `Assets.xcassets/AppIcon`).
 
 ---
 
-## 追補 v1.1 (2026-07-24): 車体の自動発見（mDNS/Bonjour）
+## 7. Constraints / Assumptions
 
-DHCP による IP ドリフトで毎回手入力・再フラッシュが必要だった痛みを解消するための機能追加。
+### 7.1 Hardware / Firmware Constraints (HC)
 
-- **FR-51**: アプリは車体を Bonjour/mDNS で発見できること。車体はホスト名 `robotbrain.local` で解決可能とし、サービス `_robotbrain._tcp`（ポート 4000）を広告すること。
-- **FR-52**: 接続先ホストの既定値を `robotbrain.local` とすること。DHCP で IP が変わっても再設定不要で接続できること。数値 IP の手入力は代替手段として残すこと。
-- **FR-53**: 設定に「車を探す（Find car）」操作を設け、`NWBrowser` で `_robotbrain._tcp` を探索し、発見時は接続先を設定して再接続、結果（発見／未発見）をユーザーに表示すること。探索は数秒でタイムアウトすること。
-- **制約**: iOS 側は Info.plist に `NSBonjourServices = ["_robotbrain._tcp"]` の宣言とローカルネットワーク権限が必要。ファーム側は STA 接続確立後に mDNS を開始すること（AP モードでも開始可）。
+> The firmware named below is a not-included Freenove derivative; the tokens and file names here are descriptive references to that external interface, not source shipped in this repository.
+
+- **HC-1**: The chassis is an ESP32-WROVER. On-device ML inference is not possible (no GPU/NPU, little RAM). All perception/cognition is done off-board (this app + the cloud).
+- **HC-2**: Commands are TCP `4000`, `#`-delimited text, `\n`-terminated. Tokens: `CMD_MOTOR` / `CMD_SERVO` / `CMD_CAMERA` / `CMD_LED` / `CMD_LED_MOD` / `CMD_MATRIX_MOD` / `CMD_BUZZER` / `CMD_VIDEO` / `CMD_POWER` / `CMD_SONIC`, etc. The ones that return a reply are `CMD_POWER#<voltage>` and `CMD_SONIC#<cm>`.
+- **HC-3**: The camera is TCP `7000`, gated by `CMD_VIDEO#1`, with frames as a 4-byte LE length + JPEG. HQVGA 240×176.
+- **HC-4**: The motors are four wheels but are driven as a left/right tank pair via `CMD_MOTOR` (`CMD_MOTOR#<left>#0#<right>`). Each value ±4095; |value| < 1600 is 0 (dead zone).
+- **HC-5**: The servos are driven via a PCA9685. `Servo_1` (ch0) / `Servo_2` (ch1). On this unit pan/tilt are **swapped** (ch0 = TILT, ch1 = PAN). For precise axis/travel control use `CMD_SERVO#<index>#<angle>` (0–180) rather than `CMD_CAMERA`.
+- **HC-6**: Patched firmware (the not-included Freenove derivative): on-device deadman stop, stop-and-hold on disconnect (no `ESP.restart`). Dead zone |speed| < 1600 ⇒ 0.
+- **HC-7**: Motion, servo drive, and body LEDs work only with the battery installed (2× 18650). The low-voltage reference is the firmware constant `LOW_VOLTAGE_VALUE 2100`.
+- **HC-8**: This unit has an HC-SR04 added to the forward head. Forward distance is available via `CMD_SONIC#<cm>` and the firmware forward veto. However, the sensor is single, forward-only, and head-posture-dependent, with no guarantee for rear / side / floor-edge / stair / low / soft / thin / angled / glass / cloth / no-echo obstacles; hence low-speed, short-pulse, supervised operation is assumed.
+- **HC-9**: There is a note that GPIO 32 is listed for both `WS2812_PIN` and `PIN_BATTERY`, so simultaneous use of the body LEDs and battery telemetry requires hardware verification (the app shall not depend on this uncertainty).
+
+### 7.2 Assumptions (AS)
+
+- **AS-1**: The chassis has joined the home Wi-Fi in STA mode and is on the same LAN as the iPhone.
+- **AS-2**: A valid OpenAI API key and access to a Vision-capable model (default `gpt-4o-mini`) are available.
+- **AS-3**: The chassis runs the patched firmware (deadman · stop-and-hold), a not-included Freenove derivative.
+- **AS-4**: The operating environment is indoor, flat, low-speed, and human-supervised, with no step or fall risk.
+- **AS-5**: This is single-owner personal use, with the build and API key not shared with third parties.
+- **AS-6**: Real motion verification is done after the battery is installed; until then, functions are verified in dry-run.
+
+---
+
+## 8. Out of Scope (OS)
+
+- **OS-1**: The chassis firmware implementation (this app references it only as an interface constraint).
+- **OS-2**: On-device (ESP32) ML/CV inference, SLAM, mapping, odometry.
+- **OS-3**: Obstacle avoidance beyond the HC-SR04 — high-speed, omnidirectional, floor-edge/stair-aware. Rear/side/cliff sensors, ToF arrays, SLAM, etc. are a separate phase and separate requirements.
+- **OS-4**: Cloud operation over SoftAP (`Sunshine`) mode (not targeted since it cannot reach the internet; local/offline-model operation is out of scope for this document).
+- **OS-5**: Multi-user / accounts / cloud sync, general App Store distribution.
+- **OS-6**: iPad / landscape layout, languages other than English and Japanese.
+- **OS-7**: Keychain / encrypted storage of the API key (noted as a recommendation in NFR-10 but not a mandatory v1 requirement).
+- **OS-8**: Offline operation of the autonomous loop (the Vision API requires the network).
+
+---
+
+## Appendix A: Implementation-Status Notes (requirement vs. current code — honest gap)
+
+As of 2026-07-28, the old assumptions about servo calibration, low battery, and the HC-SR04 mount that remained in earlier drafts no longer match reality. In the current code, servo adjustment, low-voltage stop, `CMD_SONIC`, collision escape, and the Manual/Remote/STOP state resets are implemented.
+
+The remaining honest gap is not about presence of implementation but about **the granularity of real-vehicle acceptance**. `QUALITY_ACCEPTANCE.md` holds the correspondence table of FR/NFR/RFR/RNFR against implementation, automated check, and real-vehicle check, to be filled in from real-car logs before release.
+
+---
+
+## Appendix B: Quality-Acceptance Trace
+
+Pre-release checks are governed by `QUALITY_ACCEPTANCE.md`. This appendix tracks the following against requirement ID, implementation location, static check, and real-car check: no re-drive after STOP, direct movement commands, collision escape, low light, low voltage, TTS/celebration interruption, Remote arm/disarm, Remote failure modes, and authentication / log redaction.
+
+---
+
+## Addendum v1.1 (2026-07-24): Automatic Chassis Discovery (mDNS/Bonjour)
+
+An addition to relieve the pain of having to hand-enter the IP or re-flash on each IP drift under DHCP.
+
+- **FR-51**: The app shall be able to discover the chassis via Bonjour/mDNS. The chassis shall be resolvable at hostname `robotbrain.local` and advertise the service `_robotbrain._tcp` (port 4000).
+- **FR-52**: The default connection host shall be `robotbrain.local`. Connection shall succeed without reconfiguration even when the IP changes under DHCP. Manual entry of a numeric IP shall remain as a fallback.
+- **FR-53**: The settings shall provide a "Find car" action that browses `_robotbrain._tcp` with `NWBrowser`, and on discovery sets the connection host, reconnects, and shows the user the result (found / not found). The browse shall time out within a few seconds.
+- **Constraint**: On the iOS side, the Info.plist must declare `NSBonjourServices = ["_robotbrain._tcp"]` and hold local-network permission. On the firmware side, mDNS shall start after the STA connection is established (it may also start in AP mode).

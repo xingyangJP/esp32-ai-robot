@@ -1,144 +1,154 @@
 > **Note.** The ESP32 firmware is a not-included Freenove derivative — `firmware/…` paths below are *descriptive*, not files in this repo. This feature is **shipped** (app v1.1.54): the car reboots into pure STA and the app confirms it on the network (status strings `idle | switching:<ssid> | fail:auth | fail:no_ap`).
 
-# WiFi プロビジョニング設計書 (in-app WiFi setup)
+# WiFi Provisioning Design (in-app WiFi setup)
 
-> ステータス: **完成・実車E2E成功 (v1.1.50 / reboot-to-STA + 診断 + wait-for-IP)**。設定モード→SoftAP→SET→純STA再起動→NVS credsで接続→再発見をシリアルログで確認。根本原因(AP_STAチャンネル固定)実測CONFIRMED。未プッシュ。単一の正。
-> 目的: 車体(ESP32)を **アプリだけで新しいWiFiに接続**できるようにする。引っ越し／別の家／別ルーターで **再フラッシュ不要**に。
-
----
-
-## 1. 現状 (実コード確認済み・2026-07-xx)
-
-- **アプリ側: WiFiプロビジョニングUI/ロジックはゼロ**（`ios_app/*.swift` に SSID 関連なし）。
-- **ファーム側: creds ハードコード**。`firmware/AI_Car_Firmware/wifi_secrets.h` の `WIFI_ROUTER_SSID/PASS` を `AI_Car_Firmware.ino` の `WiFi_Init()` が読み、`WiFi_Setup(0)`＝**STAモードで固定ルーターに接続**。SoftAP名 `"Sunshine"` は定義済みだが起動時は未使用。**NVS保存も WiFi スキャンも無い。**
-- 車体は mDNS `robotbrain.local` を広告、コマンド鯖 TCP `:4000`（`#`区切り `CMD_*`）＋映像 `:7000`。アプリ `CarLink` は `carIP`(既定 `robotbrain.local`) に接続。
-- **課題**: WiFi を変えるには `wifi_secrets.h` 書換え＋USB再フラッシュが必須＝可搬性が低い。
+> Status: **Shipped — verified end-to-end on the real car (app v1.1.54; the firmware reboots into pure STA, runs a short diagnostic, and waits for an IP).** Setup mode → SoftAP → SET → reboot into pure STA → connect using the credentials saved in NVS → re-discovery: all confirmed in the serial log. The root cause (AP_STA channel pinning) was confirmed by measurement on the car.
+> Goal: let the car (ESP32) **join a new WiFi network from the app alone** — no re-flash needed when you move house, visit a different home, or change routers.
 
 ---
 
-## 2. 要件
+## 1. Background (pre-feature baseline — now resolved)
+
+> This section describes the state of the code *before* in-app provisioning shipped. Everything below has since been implemented; it is kept for context. The firmware is a not-included Freenove derivative, so firmware paths are descriptive.
+
+- **App side: no WiFi provisioning UI/logic at all** (nothing SSID-related in `ios_app/*.swift`).
+- **Firmware side: credentials hardcoded.** `WiFi_Init()` in the sketch read `WIFI_ROUTER_SSID/PASS` from `firmware/AI_Car_Firmware/wifi_secrets.h` and called `WiFi_Setup(0)` = **connect to a fixed router in STA mode**. A SoftAP name (`"Sunshine"`) was defined but unused at boot. **No NVS persistence and no WiFi scan.**
+- The car advertises mDNS `robotbrain.local`, a command server on TCP `:4000` (`#`-delimited `CMD_*`), and a video stream on `:7000`. The app's `CarLink` connects to `carIP` (default `robotbrain.local`).
+- **Problem**: changing WiFi required editing `wifi_secrets.h` and re-flashing over USB — poor portability.
+
+---
+
+## 2. Requirements
 
 **FR**
-- FR-P1: アプリから、車体が接続する WiFi の **SSID/パスワードを設定**できる（USB/再フラッシュ不要）。
-- FR-P2: SSID は **車体がスキャンした一覧から選択**できる（iOSはWiFiスキャン不可のため車体が供給）。手入力（ステルスSSID）も可。
-- FR-P3: 設定した creds は車体の **NVS(不揮発)に保存**され、再起動後も維持。
-- FR-P4: 設定後、車体は STA で新WiFiに接続し、**アプリが接続成功を確認**して通常モードに戻る。
-- FR-P5: **失敗フォールバック**: creds が無い/接続失敗/一定時間 STA 不通 → 車体は SoftAP プロビジョニングモードに（再入可能・詰まない）。
-- FR-P6: アプリは網の渡り（車体AP⇄家WiFi）を **可能な限り自動化**（`NEHotspotConfiguration`）。不可時は手動手順を明示。
+- FR-P1: From the app, **set the SSID/password** the car connects to (no USB / re-flash).
+- FR-P2: The SSID can be **picked from a list the car scanned** (iOS cannot scan WiFi, so the car supplies it). Manual entry (hidden SSID) is also allowed.
+- FR-P3: The credentials are **saved in the car's NVS (non-volatile)** and persist across reboots.
+- FR-P4: After setup the car connects to the new WiFi in STA mode, and **the app confirms the connection succeeded** before returning to normal mode.
+- FR-P5: **Failure fallback**: no credentials / connection failure / STA unreachable for a while → the car re-enters SoftAP provisioning mode (re-enterable, never gets stuck).
+- FR-P6: The app **automates the network hop** (car AP ⇄ home WiFi) **as much as possible** (`NEHotspotConfiguration`). Where that's not possible, it shows manual steps.
 
 **NFR**
-- NFR-P1: **2.4GHz のみ**（ESP32 は 5GHz 非対応）＝UIで明示、5GHz SSID は警告。
-- NFR-P2: 既存の LAN/Remote/探索の動作を壊さない（プロビジョニングは別モード）。
-- NFR-P3: セキュリティ: SoftAP はパスワード付き（近所から勝手に設定されない）。パスは NVS 平文（デバイス標準）＋ローカルAP内送信のみ。ログに出さない。
-- NFR-P4: LAN/Remote いずれのアプリモードからも設定導線に入れる。
+- NFR-P1: **2.4 GHz only** (the ESP32 has no 5 GHz radio) — stated in the UI; 5 GHz SSIDs are flagged.
+- NFR-P2: Do not break existing LAN / Remote / discovery behavior (provisioning is a separate mode).
+- NFR-P3: Security: the SoftAP has a password (so a neighbor can't reconfigure it); the password travels only inside the local AP and is stored as NVS plaintext (device standard). Never printed to logs.
+- NFR-P4: The setup entry point is reachable from either app mode (LAN or Remote).
 
 ---
 
-## 3. 重要な制約（正直に・盛らない）
+## 3. Key constraints (stated plainly, no overselling)
 
-1. **iOSアプリは WiFi をスキャンできない**（近隣SSID一覧の公開APIなし; NEHotspotHelper は MFi 限定）。→ **車体(ESP32 `WiFi.scanNetworks()`)がスキャンして一覧をアプリへ返す**。
-2. **スマホは網を2回渡る**: 家WiFi → 車体AP(設定) → 家WiFi(通常)。同一ネットでないと会話不可。`NEHotspotConfigurationManager` で「このAPに繋ぐ」をアプリから発行可（**要エンタイトルメント `com.apple.developer.networking.HotspotConfiguration`**、iOSが確認ダイアログを出す）。家WiFiへの復帰も同APIで（パスをアプリが保持していれば自動、未知なら手動案内）。
-3. **`#` デリミタ問題（設計の肝）**: 既存 CMD は `#` 区切り。**WiFiパスワード/SSIDに `#` や区切り文字が入りうる**ため、`CMD_WIFI_SET#ssid#pass` は壊れる。→ **フィールドを base64 エンコード**して送る（`CMD_WIFI_SET#<b64ssid>#<b64pass>`）か、HTTP(下記代替)を使う。**必須対策**。
-4. SoftAP 中はスマホにインターネットが無い（Remote/クラウドは使えない＝設定は純ローカル）。
-5. mDNS 再発見: STA 復帰後、アプリは `robotbrain.local` で車体を再発見（DHCP IP 変動に強い）。
+1. **An iOS app cannot scan WiFi** (no public API to list nearby SSIDs; NEHotspotHelper is MFi-only). → **The car (ESP32 `WiFi.scanNetworks()`) scans and returns the list to the app.**
+2. **The phone crosses networks twice**: home WiFi → car AP (setup) → home WiFi (normal). They must be on the same network to talk. `NEHotspotConfigurationManager` lets the app request "join this AP" (**requires the entitlement `com.apple.developer.networking.HotspotConfiguration`**; iOS shows a confirmation dialog). The return to home WiFi is automatic: the app joins the car AP with `joinOnce = true`, so iOS drops the car AP and rejoins the previous network on its own when the AP disappears — **the app never needs the home password**.
+3. **The `#`-delimiter problem (the design's crux)**: existing CMDs are `#`-delimited. **A WiFi password/SSID can itself contain `#` or delimiters**, so `CMD_WIFI_SET#ssid#pass` would break. → **base64-encode the fields** (`CMD_WIFI_SET#<b64ssid>#<b64pass>`). **Mandatory.**
+4. While on the SoftAP the phone has no internet (Remote/cloud are unavailable — setup is purely local).
+5. mDNS re-discovery: after returning to STA the app re-finds the car at `robotbrain.local` (robust to DHCP IP changes).
 
 ---
 
-## 4. アーキテクチャ / 状態遷移
+## 4. Architecture / state machine
 
-### 4.1 車体ファームの状態機械
+### 4.1 Car firmware state machine (descriptive — firmware is a not-included Freenove derivative)
 ```
 [BOOT]
-  └─ NVS に creds 有り? 
-       ├─ 有 → STA接続を試行（最大 STA_TRY_MS 例:20s）
-       │        ├─ 成功 → [NORMAL] (mDNS広告, :4000/:7000, 既存動作すべて)
-       │        └─ 失敗/タイムアウト → [PROVISION]
-       └─ 無 → [PROVISION]
+  └─ NVS credentials present?
+       ├─ yes → try STA connect (up to STA_TRY_MS, e.g. 20 s)
+       │         ├─ success → [NORMAL]  (mDNS advertise, :4000 / :7000, all existing behavior)
+       │         └─ fail / timeout → [PROVISION]
+       └─ no  → [PROVISION]
 
-[PROVISION]  (SoftAP "RobotBrain-setup" をパス付きで起動; :4000 コマンド鯖は稼働)
-  ├─ CMD_WIFI_SCAN        → 近隣SSID一覧(JSON or 区切り)を返す
-  ├─ CMD_WIFI_SET#b64ssid#b64pass → NVS保存 → STA接続試行
-  │        ├─ 成功 → CMD_WIFI_STATUS が "ok:<ip>" → 数秒後 [NORMAL] へ(SoftAP停止)
-  │        └─ 失敗 → CMD_WIFI_STATUS が "fail:<reason>" → PROVISION 継続(再入力可)
-  └─ (無操作タイムアウトでも PROVISION 維持=詰まない)
+[PROVISION]  (SoftAP "RobotBrain-setup" with a password; the :4000 command server keeps running)
+  ├─ CMD_WIFI_SCAN                  → return the neighbor SSID list (base64 tab/newline table)
+  ├─ CMD_WIFI_SET#b64ssid#b64pass   → save to NVS → REBOOT INTO PURE STA to join
+  │         (next boot: STA joins → [NORMAL];  STA fails → back to [PROVISION], and the
+  │          firmware keeps the reason so the next CMD_WIFI_STATUS returns fail:auth / fail:no_ap)
+  ├─ CMD_WIFI_STATUS                → idle | switching:<ssid> | fail:auth | fail:no_ap | fail:<n>
+  ├─ CMD_WIFI_FORGET                → clear NVS → reboot into SoftAP setup
+  └─ (an idle / no-op session never gets stuck — it stays in PROVISION until credentials arrive)
 ```
-- **プロビジョニング中も `:4000` を使う**（新規HTTP鯖を足さず既存作法に載せる）。SoftAP のIPは既定 `192.168.4.1`。
-- STA接続の確認は **ESP32側で** `WiFi.status()==WL_CONNECTED` を待ち、成功時に取得IPを `CMD_WIFI_STATUS` で返す。
+- **Provisioning also uses `:4000`** (no extra HTTP server — it rides on the existing convention). The SoftAP address is the default `192.168.4.1`.
+- **Why reboot into *pure* STA rather than switch in place?** AP_STA (concurrent AP+STA) cannot reliably associate while the phone pins the AP's channel — this was the confirmed root cause. So on `CMD_WIFI_SET` the car saves the creds, drops the AP, and reboots into pure STA. Success is therefore *not* reported by status polling (the AP is gone); the app confirms by re-finding the car on the network. After a successful join the car re-advertises mDNS.
 
-### 4.2 アプリのフロー
-1. ユーザーが設定画面で「車体のWiFiを設定」をタップ（or 車体が `robotbrain.local` で見つからない時に自動で促す）。
-2. アプリが `NEHotspotConfiguration` で **車体AP `RobotBrain-setup` に接続**（要エンタイトルメント; iOS確認ダイアログ）。
-3. アプリが `192.168.4.1:4000` に接続 → `CMD_WIFI_SCAN` → **SSID一覧を表示**。ユーザーが選択＋パス入力（2.4GHz以外は警告）。
-4. アプリが `CMD_WIFI_SET#<b64ssid>#<b64pass>` を送信。
-5. アプリが `CMD_WIFI_STATUS` をポーリング（数秒〜STA_TRY_MS）。
-   - `ok:<ip>` → 成功。アプリは `NEHotspotConfiguration` で **家WiFiに復帰**（パス既知なら自動、未知なら「手動で家WiFiに戻って」と案内）→ `robotbrain.local` で **mDNS再発見→通常モード** ✅
-   - `fail:...` → エラー表示＋SSID/パス再入力（手順3へ）。
-6. どの段階でも「キャンセル」で家WiFiへ復帰。
+### 4.2 App flow
+1. In Settings, tap **"Set up the car's WiFi"** (`wifi.entry` → `WiFiSetupView`). Disabled in Remote mode (the car AP has no internet, so setup is LAN-only).
+2. The app calls `NEHotspotConfiguration` to **join the car AP `RobotBrain-setup`** (passphrase `robotbrain`, `joinOnce = true`; iOS shows a join dialog). If the entitlement/capability is unavailable, it falls back to on-screen **"join it manually in Settings"** instructions.
+3. The app connects to `192.168.4.1:4000`, sends `CMD_WIFI_SCAN`, and **shows the SSID list**. It also reads `CMD_WIFI_STATUS`: if a **prior** attempt failed, it surfaces the reason (wrong password / SSID not found) as a hint. The user picks an SSID and types the password (a leading/trailing space is trimmed before sending).
+4. The app sends `CMD_WIFI_SET#<b64ssid>#<b64pass>`. The firmware replies `accepted`.
+5. The app **suspends the main LAN link** (so it won't fight the confirmation probe for the car's single-client `:4000` socket) and releases the car AP. The car saves the creds and **reboots into pure STA** to join. Because `joinOnce` was set, the phone **automatically returns to its previous (home) WiFi** when the car AP drops — no home password needed.
+6. After ~6 s the app **confirms** by re-finding the car on the network: it polls `robotbrain.local:4000` with `CMD_POWER` for up to ~40 s (`probeCar`).
+   - reachable → success. The app re-discovers the car via mDNS and returns to normal mode. ✅
+   - not reachable within the window → **"unconfirmed"** (the car may be on a different network, or it failed to join). The user can retry.
+7. Cancel/back at any stage leaves the flow; the phone returns to its home WiFi on its own.
+
+> There is also a **"Force setup mode"** control (`wifi.enterSetup`): over the current LAN link it sends `CMD_WIFI_FORGET`, which clears the car's saved credentials and reboots it into SoftAP setup — handy for choosing a new network *before* you move. It's disabled in Remote mode and when the command link isn't connected.
 
 ---
 
-## 5. ワイヤプロトコル (新規 CMD, `Freenove_4WD_Car_WiFi.h` に追加)
+## 5. Wire protocol (provisioning CMDs — firmware-side names are descriptive; the firmware header is a not-included Freenove derivative)
 
-| CMD | 引数 | 応答 | 用途 |
+| CMD | Args | Response | Purpose |
 |---|---|---|---|
-| `CMD_WIFI_SCAN` | なし | `CMD_WIFI_SCAN#<b64 of "ssid1\trssi1\tenc1\nssid2\t..">` | 近隣AP一覧（SSIDは非ASCII対応でb64） |
-| `CMD_WIFI_SET` | `#<b64ssid>#<b64pass>` | `CMD_WIFI_SET#accepted` | 受領→NVS保存→STA試行開始 |
-| `CMD_WIFI_STATUS` | なし | `CMD_WIFI_STATUS#idle\|trying\|ok:<ip>\|fail:<reason>` | STA接続結果のポーリング |
-| `CMD_WIFI_FORGET` | なし | `CMD_WIFI_STATUS#idle` | NVSクリア→次回起動でPROVISION（デバッグ/引っ越し用） |
+| `CMD_WIFI_SCAN` | none | `CMD_WIFI_SCAN#<b64 of "ssid1\trssi1\tenc1\nssid2\t…">` | Neighbor AP list (SSIDs base64 for non-ASCII); the enc field is `open` for an open network |
+| `CMD_WIFI_SET` | `#<b64ssid>#<b64pass>` | `CMD_WIFI_SET#accepted` | Received → save to NVS → reboot into pure STA |
+| `CMD_WIFI_STATUS` | none | `CMD_WIFI_STATUS#idle\|switching:<ssid>\|fail:auth\|fail:no_ap\|fail:<n>` | Last provisioning outcome held in the SoftAP. There is no `ok:<ip>` — success is confirmed by re-discovery after the reboot, not by polling. |
+| `CMD_WIFI_FORGET` | none | (fire-and-forget) | Clear NVS → reboot into SoftAP setup (debug / relocation / the "Force setup mode" button) |
 
-- **base64 必須**（`#`/改行/非ASCII 対策, §3-3）。既存 `Get_Command` の `#` 分割はそのまま使え、値だけ b64 で安全。
-- パスワードは **シリアル/デバッグに出さない**（NFR-P3）。
-
----
-
-## 6. 実装チェックリスト（ファイル → 変更）
-
-**ファーム (`firmware/AI_Car_Firmware/`)**
-1. `Freenove_4WD_Car_WiFi.h`: `#define CMD_WIFI_SCAN/SET/STATUS/FORGET`。
-2. 新規 `wifi_provision.{h,cpp}`（or 既存 WiFi.cpp 拡張）: `Preferences`(NVS, namespace `"wifi"`) で `ssid`/`pass` 読み書き; `provisionStatus`(idle/trying/ok/fail); `startSoftAP()`（パス付き `RobotBrain-setup`）; `tryConnectSTA(ssid,pass, STA_TRY_MS)`; `scanToB64()`。
-3. `AI_Car_Firmware.ino`:
-   - `WiFi_Init()`/`setup()`: **NVS creds を優先**（有→STA試行、失敗/無→SoftAPプロビジョニング）。`wifi_secrets.h` は **初回フォールバック既定値**として残す（NVS未設定時のみ使用）＝既存挙動を壊さない。
-   - `loop()` のコマンド分岐に `CMD_WIFI_*` を追加（`Get_Command` 後、`CMD_POWER` と同様の返信）。
-   - プロビジョニング中も `:4000` accept を回す（SoftAP時も同じ鯖でOK）。STA成功後に mDNS 再広告。
-4. `wifi_secrets.h.example`: コメントに「NVS未設定時のみ使う初期値」と明記。
-
-**アプリ (`ios_app/`)**
-5. エンタイトルメント: `com.apple.developer.networking.HotspotConfiguration`（`project.yml` の entitlements）。
-6. `WiFiSetup`（新規 View, `ConfigView` から遷移 or 未発見時に自動提示）: 状態機（AP接続→スキャン一覧→SSID選択/パス入力→送信→STATUSポーリング→家WiFi復帰→mDNS確認）。5GHz/長さ等の入力バリデーション＋2.4GHz注意書き。
-7. `WiFiProvisioner`（新規, `NEHotspotConfigurationManager` ラッパ）: `joinAP("RobotBrain-setup", pass)` / `rejoin(home)` / エラー整形。iOS確認ダイアログ前提の非同期。
-8. `CarLink`（or 専用プロビジョニング接続）: `192.168.4.1:4000` への一時接続＋ `CMD_WIFI_SCAN/SET/STATUS` の送受信（base64 エンコード/デコード）。既存の LAN 接続とは分離（プロビジョニングは別コンテキスト）。
-9. `Discovery`(mDNS): STA復帰後の `robotbrain.local` 再発見をトリガ。
-10. Localizable(ja/en): 設定文言・エラー・「家WiFiに手動で戻って」案内。
+- **base64 is mandatory** (to survive `#` / newline / non-ASCII, §3-3). The existing `#`-split parser is used unchanged; only the values are base64-wrapped, which is safe.
+- **`switching:<ssid>`** is the transient state the firmware reports while it is attempting to associate; **`fail:auth`** = wrong password, **`fail:no_ap`** = SSID not found (wrong band/channel/hidden/out of range), **`fail:<n>`** = other failure with the numeric WiFi status code.
+- The password is **never printed to serial / debug** (NFR-P3).
 
 ---
 
-## 7. 失敗・エッジケース
+## 6. Implementation map (files → what shipped)
 
-- **パス間違い / 圏外**: `CMD_WIFI_STATUS#fail` → アプリで再入力。車体は PROVISION 維持（詰まない）。
-- **家WiFi自動復帰不可**（アプリがパス未保持）: 「Wi‑Fi設定で家のネットに戻してください」と明示 → 戻ったら mDNS 再発見。
-- **5GHz を選んだ**: 事前警告＋接続失敗時に理由表示。
-- **SSID/パスの `#`・非ASCII・絵文字**: base64 で回避（§3-3）。
-- **SoftAP に複数端末**: 単一接続前提（既存 `:4000` は単一クライアント）。
-- **セキュリティ**: SoftAP はパス付き; 送信はローカルAP内のみ; NVS 平文（標準）; パスをログに出さない。
-- **既存動作維持**: NVS 未設定時は従来どおり `wifi_secrets.h` の固定値で STA＝現状の挙動を壊さない（段階移行）。
+**Firmware (`firmware/AI_Car_Firmware/` — descriptive; a not-included Freenove derivative)**
+1. Provisioning CMD defines: `CMD_WIFI_SCAN / SET / STATUS / FORGET`.
+2. A WiFi-provisioning unit (`wifi_provision.{h,cpp}`): uses `Preferences` (NVS, namespace `"wifi"`) to read/write `ssid`/`pass`; tracks `provisionStatus` (idle / switching / fail); `startSoftAP()` brings up `RobotBrain-setup` **with a password**; `tryConnectSTA(ssid, pass, STA_TRY_MS)`; `scanToB64()`.
+3. The sketch:
+   - `setup()` / WiFi init: **NVS credentials take priority** (present → try STA; fail/absent → SoftAP provisioning). A `wifi_secrets.h` value remains a **first-run fallback default** (used only when NVS is unset) so existing behavior isn't broken.
+   - Command dispatch handles `CMD_WIFI_*` (parsed like the other CMDs, replies like `CMD_POWER`).
+   - The `:4000` accept loop runs during provisioning too (same server, SoftAP or STA). On `CMD_WIFI_SET` the car saves the creds and **reboots into pure STA**; on a successful join it re-advertises mDNS.
+4. `wifi_secrets.h.example`: a comment notes the value is only an initial default used when NVS is unset.
+
+**App (`ios_app/`)**
+5. Entitlement `com.apple.developer.networking.HotspotConfiguration` (`RobotBrain.entitlements`, declared in `project.yml`).
+6. `WiFiSetupView.swift` (reached from Settings, or offered when the car can't be found): the flow state machine (join AP → scan list → pick SSID / enter password → send → suspend link + leave AP → wait for reboot → confirm by re-discovery → success / unconfirmed / failed). Includes 2.4 GHz guidance and surfaces a prior attempt's fail reason.
+7. `WiFiProvisioner.swift` (an `NEHotspotConfigurationManager` wrapper + a one-shot TCP client to `:4000`): `joinCarAP()` (joinOnce), `scan()`, `setCreds()` (base64), `status()`, `leaveCarAP()`, and `probeCar()` (re-find the car on the network). Provisioning uses its own connection, separate from the normal LAN link.
+8. Wiring in `ContentView` / `RobotController`: `onSuspendLink` stops the main link so it doesn't fight `probeCar` for the car's single-client `:4000` socket; `onProvisioned` drops the current link and re-discovers on the new network. `enterWiFiSetup()` sends `CMD_WIFI_FORGET` over the LAN link.
+9. `Discovery` (mDNS): triggers `robotbrain.local` re-discovery after the car returns to STA.
+10. Localizations (ja/en): setup copy, error text, and the "return to your home WiFi manually" fallback (only needed when NEHotspot is unavailable).
 
 ---
 
-## 8. 実車でしか確定できないこと ([[state-limits-plainly]])
+## 7. Failures & edge cases
 
-- `NEHotspotConfiguration` の実機ダイアログ挙動・自動接続の成否（要 Apple Developer 実機＋エンタイトルメント）。
-- SoftAP⇄STA 切替のタイミング/安定性、`STA_TRY_MS` の適正値。
-- スキャン一覧の見え方（RSSI/隠しSSID）、2.4GHz限定の実挙動。
-- 家WiFi自動復帰がユーザ環境で通るか（パス保持の可否）。
-- ネイティブ実装前に、`wifi_secrets.h` フォールバックのままでも回帰しないことの確認。
+- **Wrong password / out of range**: the firmware reports `fail:auth` / `fail:no_ap` and the car falls back to SoftAP; the next scan surfaces the reason so re-entry isn't an opaque "couldn't connect". The car never gets stuck.
+- **NEHotspotConfiguration unavailable** (entitlement missing, or the user declines the join dialog): the app shows "join `RobotBrain-setup` manually in Settings", then continues once the phone is on the car AP.
+- **Returning to home WiFi**: automatic via `joinOnce` — the phone rejoins its previous network on its own when the car AP drops (no home password needed).
+- **Confirmation times out**: if `probeCar` can't reach the car within the window, the app shows an **"unconfirmed"** state (the car may be on a different network or failed to join); the user can retry from the top.
+- **Picked a 5 GHz SSID**: warned up front; the attempt reports `fail:no_ap`.
+- **`#` / non-ASCII / emoji in SSID or password**: avoided by base64 (§3-3).
+- **Multiple devices on the SoftAP**: single-client assumed (the existing `:4000` server is single-client).
+- **Security**: the SoftAP is password-protected; traffic stays inside the local AP; NVS stores plaintext (standard); the password is never logged.
+- **Preserving existing behavior**: when NVS is unset, the car still connects using the `wifi_secrets.h` fallback in STA — the current behavior is unchanged (staged migration).
 
 ---
 
-## 9. 未決定（実装前に選ぶ）
+## 8. Confirmed on the real car (E2E verified)
 
-- **A. 送信トランスポート**: (推奨) 既存 `:4000` ＋ base64 CMD / vs. SoftAP に小さな HTTP 鯖（ブラウザからも設定できる captive 併用）。※「アプリだけで」を最優先なら CMD、汎用性重視なら HTTP。
-- **B. 網の渡り自動化**: `NEHotspotConfiguration` で自動 / vs. 手動案内のみ（エンタイトルメント無しでも成立するが手間）。
-- **C. プロビジョニング起動条件**: 「NVS無 or STA失敗で自動 SoftAP」/ vs. 物理ボタン長押しでも入れる。
-- **D. SoftAP のSSID名/パス**（既定案: `RobotBrain-setup` / ランダム or 固定）。
+- `NEHotspotConfiguration` behaves as designed on-device (join dialog + automatic return via `joinOnce`), with the `com.apple.developer.networking.HotspotConfiguration` entitlement.
+- The SoftAP ⇄ STA transition is stable via the **reboot-into-pure-STA** approach; AP_STA channel pinning (the reason a plain in-place switch failed) was confirmed by measurement.
+- The scan list renders as expected (RSSI, hidden SSIDs), and the 2.4 GHz-only limitation holds in practice.
+- The phone's automatic return to the home WiFi works in the user's environment (no home password required, thanks to `joinOnce`).
+- With NVS unset, the `wifi_secrets.h` fallback still connects without regression (staged migration verified).
 
-推し: **A=CMD(base64)、B=自動、C=自動(STA失敗フォールバック)、D=固定パス付き**。
+---
+
+## 9. Decisions (finalized as shipped)
+
+- **A. Transport**: existing `:4000` + base64 CMDs (chosen — keeps "from the app alone" as the priority), rather than a small HTTP/captive server on the SoftAP.
+- **B. Network-hop automation**: automatic via `NEHotspotConfiguration` with `joinOnce` (chosen), rather than manual-only instructions.
+- **C. Provisioning entry**: automatic SoftAP on "NVS unset or STA failed" (chosen), *and* it can be forced over the current link with `CMD_WIFI_FORGET` ("Force setup mode").
+- **D. SoftAP identity**: fixed SSID `RobotBrain-setup` with a fixed password (`robotbrain`).
+
+Shipped configuration: **A = CMD (base64), B = automatic, C = automatic (STA-fail fallback) + forced via `CMD_WIFI_FORGET`, D = fixed SSID + password.**
