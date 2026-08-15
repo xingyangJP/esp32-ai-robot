@@ -1,0 +1,50 @@
+# Copy to config.toml and edit. config.toml is your private, git-ignored settings.
+
+[car]
+ip          = "192.168.4.1"   # SoftAP default. In STA mode, the car's LAN IP.
+cmd_port    = 4000
+camera_port = 7000
+
+[drive]
+speed_cap        = 2000    # max |motor| magnitude sent (firmware dead-zone is 1600). Keep low for safety.
+pulse_ms         = 400     # default drive-pulse length (host stops after this)
+heartbeat_hz     = 10      # arbiter tick / motor heartbeat rate
+motor_trim       = 0.0     # straight-line trim: + boosts left, - boosts right (match app's Drive trim)
+
+[safety]
+deadman_ms         = 500   # host stops if no fresh intent within this window
+vision_stale_ms    = 800   # if no decoded frame within this window -> STOP (robot is blind)
+low_voltage        = 6.6   # volts; below this, refuse new motion (tune to your pack)
+operator_deadman_ms = 1500 # REMOTE only: bridge STOPs if no phone heartbeat within this window
+                           # (twin deadman: operator liveness + local intent freshness). Also stops
+                           # immediately if the relay uplink drops. LAN mode ignores this.
+
+[brain]
+provider   = "gemini"      # "gemini" | "openai" | "anthropic" | "none" (dry-run, no API)
+model      = "gemini-2.0-flash"
+api_key_env = "GEMINI_API_KEY"   # name of the env var holding the key (never hard-code the key)
+decision_hz = 0.7          # VLM decision cadence (Hz). Slow is fine.
+dry_run    = true          # true = plan + log only, NEVER send motion (safe on USB / no battery)
+
+[servo]
+# Pan/tilt calibration; MUST match the iOS app's ConfigView so LAN and Remote aim
+# identically (DESIGN.md §4). This car has the pan/tilt servos physically swapped.
+swap         = true        # true: pan -> servo2(ch1), tilt -> servo1(ch0)
+pan_neutral  = 90          # servo angle that points the head straight ahead (pan)
+tilt_neutral = 18          # servo angle that levels the head (tilt)
+pan_invert   = false       # true if the pan servo turns the opposite way (match app's Invert pan)
+
+[remote]
+# Cloud remote (bridge_main.py). The bridge runs the brain locally and relays a
+# preview + status to the phone through the Cloud Run relay. See REMOTE.md.
+relay_url        = "wss://<your-relay>.asia-northeast1.run.app"  # Cloud Run relay; ws://localhost:8080 for local dev
+room             = "dev"                  # only used when auth = "dev" (AUTH_DISABLED local relay)
+token            = ""                     # unused when auth = "firebase"
+preview_hz       = 4                      # JPEG preview frames/sec sent to the phone (bandwidth)
+status_hz        = 2                      # telemetry/status messages/sec sent to the phone
+# Firebase identity — the relay pairs the phone and this bridge by the SAME uid.
+# The phone signs in with Apple; the bridge mints a custom token for the same uid.
+auth             = "firebase"             # "firebase" (prod wss relay) | "dev" (local AUTH_DISABLED room)
+owner_uid        = ""                     # the uid the iOS app shows after Sign in with Apple
+service_account  = "service-account.json" # path to the bridge's service-account JSON key (git-ignored)
+api_key          = ""                     # a Firebase Web API key (Identity Toolkit token exchange)

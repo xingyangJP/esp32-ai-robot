@@ -1,0 +1,13 @@
+# Host-brain dependencies (Python 3.11+)
+# Install:  python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+numpy>=1.26
+opencv-python>=4.9        # JPEG decode + (optional) local color detection
+pillow>=10.0              # image encode for the VLM API
+websockets>=13.0          # bridge_main relay_link + relay server + bridge_relay_test
+firebase-admin>=6.5       # REMOTE mode only: mint the bridge's custom token (firebase_auth.py)
+tomli>=2.0 ; python_version < "3.11"
+
+# Pick ONE model provider (uncomment the one you use):
+# google-generativeai>=0.8   # Gemini
+# openai>=1.40               # OpenAI GPT-4o family
+# anthropic>=0.40            # Claude

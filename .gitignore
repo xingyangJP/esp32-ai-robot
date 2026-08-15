@@ -1,0 +1,32 @@
+# --- secrets (NEVER commit) ---
+.env
+*.env
+**/wifi_secrets.h
+**/config.toml
+# bridge Firebase service-account key (REMOTE mode)
+**/service-account.json
+# Firebase iOS client config (kept local; low-sensitivity but out of git)
+**/GoogleService-Info.plist
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+*venv/
+
+# --- captures / scratch ---
+snapshot*.jpg
+snap*.jpg
+
+# --- arduino build output ---
+build/
+
+# --- macOS ---
+.DS_Store
+
+# --- Xcode / iOS ---
+**/xcuserdata/
+**/*.xcuserstate
+DerivedData/
+*.xcworkspace/xcshareddata/swiftpm/
